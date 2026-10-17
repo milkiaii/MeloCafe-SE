@@ -2995,14 +2995,14 @@ std::vector<PPCBasicBlockInfo> PPCRecompiler_DetermineBasicBlockRange(PPCFunctio
 bool PPCIMLGen_FillBasicBlock(ppcImlGenContext_t& ppcImlGenContext, PPCBasicBlockInfo& basicBlockInfo)
 {
 	ppcImlGenContext.currentOutputSegment = basicBlockInfo.GetSegmentForInstructionAppend();
-	ppcImlGenContext.currentInstruction = (uint32*)(memory_base + basicBlockInfo.startAddress);
+	ppcImlGenContext.currentInstruction = (uint32*)(memory_translate(basicBlockInfo.startAddress));
 
 	uint32* firstCurrentInstruction = ppcImlGenContext.currentInstruction;
-	uint32* endCurrentInstruction = (uint32*)(memory_base + basicBlockInfo.lastAddress);
+	uint32* endCurrentInstruction = (uint32*)(memory_translate(basicBlockInfo.lastAddress));
 
 	while (ppcImlGenContext.currentInstruction <= endCurrentInstruction)
 	{
-		uint32 addressOfCurrentInstruction = (uint32)((uint8*)ppcImlGenContext.currentInstruction - memory_base);
+		uint32 addressOfCurrentInstruction = memory_reverseTranslate(ppcImlGenContext.currentInstruction);
 		ppcImlGenContext.ppcAddressOfCurrentInstruction = addressOfCurrentInstruction;
 
 		if (PPCRecompiler_decodePPCInstruction(&ppcImlGenContext))
@@ -3065,7 +3065,7 @@ bool PPCRecompiler_IsBasicBlockATightFiniteLoop(IMLSegment* imlSegment, PPCBasic
 	if (imlSegment->nextSegmentBranchTaken != imlSegment)
 		return false;
 
-	uint32 opcode = *(uint32be*)(memory_base + basicBlockInfo.lastAddress);
+	uint32 opcode = *(uint32be*)(memory_translate(basicBlockInfo.lastAddress));
 	if (Espresso::GetPrimaryOpcode(opcode) != Espresso::PrimaryOpcode::BC)
 		return false;
 	uint32 BO, BI, BD;

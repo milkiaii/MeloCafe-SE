@@ -1,4 +1,5 @@
 #pragma once
+#include "Cafe/HW/MMU/MMUTranslate.h"
 
 void memory_init();
 void memory_mapForCurrentTitle();
@@ -20,15 +21,19 @@ extern uint8* memory_base; // points to base of PowerPC address space
 // this for every emulated memory access and must not depend on LTO to fold it away
 inline uint8* memory_getPointerFromVirtualOffset(uint32 virtualOffset)
 {
-	return memory_base + virtualOffset;
+	return memory_translate(virtualOffset);
 }
 
 inline uint8* memory_getPointerFromVirtualOffsetAllowNull(uint32 virtualOffset)
 {
 	if (virtualOffset == 0)
 		return nullptr;
-	return memory_base + virtualOffset;
+	return memory_translate(virtualOffset);
 }
+
+// True if the guest range [address, address+size) is backed by reserved host memory. Always true in linear mode
+// (the whole 4GiB is reserved), in page table mode only guest ranges that were packed into the arena qualify.
+bool memory_isGuestRangeReserved(uint32 address, uint32 size);
 
 enum class MMU_MEM_AREA_ID
 {
@@ -69,7 +74,7 @@ struct MMURange
 	uint8* getPtr() const
 	{
 		cemu_assert_debug(m_isMapped);
-		return memory_base + baseAddress;
+		return memory_translate(baseAddress);
 	}
 
 	uint32 getBase() const
@@ -234,12 +239,12 @@ void memory_readBytes(VAddr address, std::array<uint8, count>& buffer)
 
 template <typename T> inline T memory_read(VAddr address)
 {
-	return *(betype<T>*)(memory_base + address);
+	return *(betype<T>*)memory_translate(address);
 }
 
 template <typename T> inline void memory_write(VAddr address, T value)
 {
-	*(betype<T>*)(memory_base + address) = value;
+	*(betype<T>*)memory_translate(address) = value;
 }
 
 // LLE implementation
@@ -289,4 +294,4 @@ namespace MMU
 
 }
 
-#define MMU_IsInPPCMemorySpace(__ptr) ((const uint8*)(__ptr) >= memory_base && (const uint8*)(__ptr) < (memory_base + 0x100000000))
+#define MMU_IsInPPCMemorySpace(__ptr) memory_isHostPtrInGuestSpace((const void*)(__ptr))

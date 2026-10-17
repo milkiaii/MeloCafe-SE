@@ -404,7 +404,7 @@ void PatchEntryInstruction::applyPatch()
 		cemu_assert_debug(false);
 		return;
 	}
-	uint8* patchAddr = (uint8*)memory_base + addr;
+	uint8* patchAddr = memory_translate(addr);
 	memcpy(m_dataBackup, patchAddr, m_length);
 	memcpy(patchAddr, m_dataWithRelocs, m_length);
 	PPCRecompiler_invalidateRange(addr, addr + m_length);
@@ -419,7 +419,7 @@ void PatchEntryInstruction::undoPatch()
 		cemu_assert_debug(false);
 		return;
 	}
-	uint8* patchAddr = (uint8*)memory_base + addr;
+	uint8* patchAddr = memory_translate(addr);
 	memcpy(patchAddr, m_dataBackup, m_length);
 	PPCRecompiler_invalidateRange(addr, addr + m_length);
     PPCInterpreter_invalidateBlockCacheRange(addr, m_length);

@@ -110,7 +110,7 @@ void LatteBufferCache_LoadRemappedUniforms(LatteDecompilerShader* shader, float*
 		MPTR physicalAddr = LatteGPUState.contextRegister[shaderUniformRegisterOffset + bufferGroup.kcacheBankIdOffset / 4];
 		if (physicalAddr)
 		{
-			uint8* uniformBase = memory_base + physicalAddr;
+			uint8* uniformBase = memory_translate(physicalAddr);
 			for (auto& it : bufferGroup.entries)
 			{
 				uint64* regDest = (uint64*)((uint8*)uniformData + it.mappedIndexOffset);

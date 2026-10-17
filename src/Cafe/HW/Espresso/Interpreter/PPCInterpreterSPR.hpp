@@ -168,13 +168,13 @@ static void setSCR(PPCInterpreter_t* hCPU, uint32 newValue)
 
 		//memcpy(memory_base + 0xFFE00000, memory_base + 0x08000000, 0x180000);
 		// hack - clear low memory (where bootrom was mapped/loaded)
-		memset(memory_base, 0, 0x4000);
+		memset(memory_translate(0), 0, 0x4000);
 		//// todo - normally IOSU sets up some stuff here (probably)
 		
 		// for debugging purposes make lowest page read-only
 #ifdef _WIN32
 		DWORD oldProtect;
-		VirtualProtect(memory_base, 0x1000, PAGE_READONLY, &oldProtect);
+		VirtualProtect(memory_translate(0), 0x1000, PAGE_READONLY, &oldProtect);
 #endif
 	}
 	debug_printf("Set SCR to 0x%08x\n", newValue);
@@ -266,13 +266,13 @@ static void setDMAL(PPCInterpreter_t* hCPU, uint32 newValue)
 		{
 			// locked cache -> memory
 			debug_printf("L2->MEM %08x -> %08x size: 0x%x\n", memAddr, 0xE0000000 + cacheAddr, transferLength);
-			memcpy(memory_getPointerFromVirtualOffset(memAddr), memory_base+0xE0000000+cacheAddr, transferLength);
+			memcpy(memory_getPointerFromVirtualOffset(memAddr), memory_translate(0xE0000000+cacheAddr), transferLength);
 		}
 		else
 		{
 			// memory -> locked cache
 			debug_printf("MEM->L2 %08x -> %08x size: 0x%x\n", 0xE0000000 + cacheAddr, memAddr, transferLength);
-			memcpy(memory_base + 0xE0000000 + cacheAddr, memory_getPointerFromVirtualOffset(memAddr), transferLength);
+			memcpy(memory_translate(0xE0000000 + cacheAddr), memory_getPointerFromVirtualOffset(memAddr), transferLength);
 		}
 		newValue &= ~2;
 		hCPU->sprExtended.dmaL = newValue;

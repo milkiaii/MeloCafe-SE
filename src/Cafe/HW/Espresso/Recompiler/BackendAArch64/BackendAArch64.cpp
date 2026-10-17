@@ -1095,6 +1095,33 @@ bool AArch64GenContext_t::macro(IMLInstruction* imlInstruction)
 	return false;
 }
 
+// Guest memory access.
+// Linear mode:      host = MEM_BASE_REG + guest (MEM_BASE_REG holds memory_base)
+// Page table mode:  host = pageTable[guest >> PAGE_SHIFT] + (guest & PAGE_MASK) (MEM_BASE_REG holds the page table address).
+//                   The translation is emitted by emitGuestAddressTranslate() which turns the guest address in TEMP_GPR1.W into a
+//                   host pointer in TEMP_GPR1.X and clobbers TEMP_GPR2. Callers must therefore translate BEFORE preparing store data in TEMP_GPR2.
+static void emitGuestAddressTranslate(AArch64GenContext_t& ctx)
+{
+	if (!memory_isPageTableMode())
+		return;
+	constexpr uint32 pageShift = MMUTranslate::PAGE_SHIFT;
+	ctx.lsr(TEMP_GPR2.WReg, TEMP_GPR1.WReg, pageShift); // page index (upper 32 bits are zeroed by the W write)
+	ctx.ldr(TEMP_GPR2.XReg, AdrExt(MEM_BASE_REG, TEMP_GPR2.XReg, ExtMod::LSL, 3)); // host page pointer
+	ctx.lsl(TEMP_GPR1.WReg, TEMP_GPR1.WReg, 32 - pageShift);
+	ctx.lsr(TEMP_GPR1.WReg, TEMP_GPR1.WReg, 32 - pageShift); // offset inside the page
+	ctx.add(TEMP_GPR1.XReg, TEMP_GPR2.XReg, TEMP_GPR1.XReg);
+}
+
+// invokes f with the addressing mode that accesses the guest address prepared in TEMP_GPR1 (translated first in page table mode)
+template<typename F>
+static void withGuestMemAdr(F&& f)
+{
+	if (memory_isPageTableMode())
+		f(AdrUimm(TEMP_GPR1.XReg, 0));
+	else
+		f(AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW));
+}
+
 bool AArch64GenContext_t::load(IMLInstruction* imlInstruction, bool indexed)
 {
 	cemu_assert_debug(imlInstruction->op_storeLoad.registerData.GetRegFormat() == IMLRegFormat::I32);
@@ -1112,43 +1139,45 @@ bool AArch64GenContext_t::load(IMLInstruction* imlInstruction, bool indexed)
 	if (indexed)
 		add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
 
-	auto adr = AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW);
-	if (imlInstruction->op_storeLoad.copyWidth == 32)
-	{
-		ldr(dataReg, adr);
-		if (switchEndian)
-			rev(dataReg, dataReg);
-	}
-	else if (imlInstruction->op_storeLoad.copyWidth == 16)
-	{
-		if (switchEndian)
-		{
-			ldrh(dataReg, adr);
-			rev(dataReg, dataReg);
-			if (signExtend)
-				asr(dataReg, dataReg, 16);
-			else
-				lsr(dataReg, dataReg, 16);
-		}
-		else
-		{
-			if (signExtend)
-				ldrsh(dataReg, adr);
-			else
-				ldrh(dataReg, adr);
-		}
-	}
-	else if (imlInstruction->op_storeLoad.copyWidth == 8)
-	{
-		if (signExtend)
-			ldrsb(dataReg, adr);
-		else
-			ldrb(dataReg, adr);
-	}
-	else
-	{
+	emitGuestAddressTranslate(*this);
+	const uint32 copyWidth = imlInstruction->op_storeLoad.copyWidth;
+	if (copyWidth != 32 && copyWidth != 16 && copyWidth != 8)
 		return false;
-	}
+	withGuestMemAdr([&](const auto& adr)
+	{
+		if (copyWidth == 32)
+		{
+			ldr(dataReg, adr);
+			if (switchEndian)
+				rev(dataReg, dataReg);
+		}
+		else if (copyWidth == 16)
+		{
+			if (switchEndian)
+			{
+				ldrh(dataReg, adr);
+				rev(dataReg, dataReg);
+				if (signExtend)
+					asr(dataReg, dataReg, 16);
+				else
+					lsr(dataReg, dataReg, 16);
+			}
+			else
+			{
+				if (signExtend)
+					ldrsh(dataReg, adr);
+				else
+					ldrh(dataReg, adr);
+			}
+		}
+		else
+		{
+			if (signExtend)
+				ldrsb(dataReg, adr);
+			else
+				ldrb(dataReg, adr);
+		}
+	});
 	return true;
 }
 
@@ -1167,40 +1196,42 @@ bool AArch64GenContext_t::store(IMLInstruction* imlInstruction, bool indexed)
 	add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
 	if (indexed)
 		add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, gpReg<WReg>(imlInstruction->op_storeLoad.registerMem2));
-	AdrExt adr = AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW);
-	if (imlInstruction->op_storeLoad.copyWidth == 32)
-	{
-		if (swapEndian)
-		{
-			rev(TEMP_GPR2.WReg, dataReg);
-			str(TEMP_GPR2.WReg, adr);
-		}
-		else
-		{
-			str(dataReg, adr);
-		}
-	}
-	else if (imlInstruction->op_storeLoad.copyWidth == 16)
-	{
-		if (swapEndian)
-		{
-			rev(TEMP_GPR2.WReg, dataReg);
-			lsr(TEMP_GPR2.WReg, TEMP_GPR2.WReg, 16);
-			strh(TEMP_GPR2.WReg, adr);
-		}
-		else
-		{
-			strh(dataReg, adr);
-		}
-	}
-	else if (imlInstruction->op_storeLoad.copyWidth == 8)
-	{
-		strb(dataReg, adr);
-	}
-	else
-	{
+	const uint32 copyWidth = imlInstruction->op_storeLoad.copyWidth;
+	if (copyWidth != 32 && copyWidth != 16 && copyWidth != 8)
 		return false;
-	}
+	emitGuestAddressTranslate(*this); // uses TEMP_GPR2 as scratch, so this has to happen before the store data is prepared in TEMP_GPR2
+	withGuestMemAdr([&](const auto& adr)
+	{
+		if (copyWidth == 32)
+		{
+			if (swapEndian)
+			{
+				rev(TEMP_GPR2.WReg, dataReg);
+				str(TEMP_GPR2.WReg, adr);
+			}
+			else
+			{
+				str(dataReg, adr);
+			}
+		}
+		else if (copyWidth == 16)
+		{
+			if (swapEndian)
+			{
+				rev(TEMP_GPR2.WReg, dataReg);
+				lsr(TEMP_GPR2.WReg, TEMP_GPR2.WReg, 16);
+				strh(TEMP_GPR2.WReg, adr);
+			}
+			else
+			{
+				strh(dataReg, adr);
+			}
+		}
+		else
+		{
+			strb(dataReg, adr);
+		}
+	});
 	return true;
 }
 
@@ -1211,10 +1242,22 @@ void AArch64GenContext_t::atomic_cmp_store(IMLInstruction* imlInstruction)
 	WReg valReg = gpReg<WReg>(imlInstruction->op_atomic_compare_store.regWriteValue);
 	WReg cmpValReg = gpReg<WReg>(imlInstruction->op_atomic_compare_store.regCompareValue);
 
+	// TEMP_GPR1 = host pointer of the guest address in eaReg
+	auto computeHostPtr = [&]()
+	{
+		if (memory_isPageTableMode())
+		{
+			mov(TEMP_GPR1.WReg, eaReg);
+			emitGuestAddressTranslate(*this); // clobbers TEMP_GPR2
+		}
+		else
+			add(TEMP_GPR1.XReg, MEM_BASE_REG, eaReg, ExtMod::UXTW);
+	};
+
 	if (s_cpu.isAtomicSupported())
 	{
+		computeHostPtr();
 		mov(TEMP_GPR2.WReg, cmpValReg);
-		add(TEMP_GPR1.XReg, MEM_BASE_REG, eaReg, ExtMod::UXTW);
 		casal(TEMP_GPR2.WReg, valReg, AdrNoOfs(TEMP_GPR1.XReg));
 		cmp(TEMP_GPR2.WReg, cmpValReg);
 		cset(outReg, Cond::EQ);
@@ -1224,7 +1267,7 @@ void AArch64GenContext_t::atomic_cmp_store(IMLInstruction* imlInstruction)
 		Label notEqual;
 		Label storeFailed;
 
-		add(TEMP_GPR1.XReg, MEM_BASE_REG, eaReg, ExtMod::UXTW);
+		computeHostPtr();
 		L(storeFailed);
 		ldaxr(TEMP_GPR2.WReg, AdrNoOfs(TEMP_GPR1.XReg));
 		cmp(TEMP_GPR2.WReg, cmpValReg);
@@ -1252,7 +1295,8 @@ bool AArch64GenContext_t::fpr_load(IMLInstruction* imlInstruction, bool indexed)
 		add_imm(TEMP_GPR1.WReg, realRegisterMem, adrOffset, TEMP_GPR1.WReg);
 		if (indexed)
 			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, indexReg);
-		ldr(TEMP_GPR2.WReg, AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW));
+		emitGuestAddressTranslate(*this);
+		withGuestMemAdr([&](const auto& adr) { ldr(TEMP_GPR2.WReg, adr); });
 		rev(TEMP_GPR2.WReg, TEMP_GPR2.WReg);
 		fmov(dataSReg, TEMP_GPR2.WReg);
 
@@ -1270,7 +1314,8 @@ bool AArch64GenContext_t::fpr_load(IMLInstruction* imlInstruction, bool indexed)
 		add_imm(TEMP_GPR1.WReg, realRegisterMem, adrOffset, TEMP_GPR1.WReg);
 		if (indexed)
 			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, indexReg);
-		ldr(TEMP_GPR2.XReg, AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW));
+		emitGuestAddressTranslate(*this);
+		withGuestMemAdr([&](const auto& adr) { ldr(TEMP_GPR2.XReg, adr); });
 		rev(TEMP_GPR2.XReg, TEMP_GPR2.XReg);
 		fmov(dataDReg, TEMP_GPR2.XReg);
 	}
@@ -1297,6 +1342,7 @@ bool AArch64GenContext_t::fpr_store(IMLInstruction* imlInstruction, bool indexed
 		add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
 		if (indexed)
 			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, indexReg);
+		emitGuestAddressTranslate(*this); // before TEMP_GPR2 receives the store data
 
 		if (imlInstruction->op_storeLoad.flags2.notExpanded)
 		{
@@ -1309,25 +1355,27 @@ bool AArch64GenContext_t::fpr_store(IMLInstruction* imlInstruction, bool indexed
 			fmov(TEMP_GPR2.WReg, TEMP_FPR.SReg);
 		}
 		rev(TEMP_GPR2.WReg, TEMP_GPR2.WReg);
-		str(TEMP_GPR2.WReg, AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW));
+		withGuestMemAdr([&](const auto& adr) { str(TEMP_GPR2.WReg, adr); });
 	}
 	else if (mode == PPCREC_FPR_ST_MODE_DOUBLE)
 	{
 		add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
 		if (indexed)
 			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, indexReg);
+		emitGuestAddressTranslate(*this);
 		fmov(TEMP_GPR2.XReg, dataDReg);
 		rev(TEMP_GPR2.XReg, TEMP_GPR2.XReg);
-		str(TEMP_GPR2.XReg, AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW));
+		withGuestMemAdr([&](const auto& adr) { str(TEMP_GPR2.XReg, adr); });
 	}
 	else if (mode == PPCREC_FPR_ST_MODE_UI32_FROM_PS0)
 	{
 		add_imm(TEMP_GPR1.WReg, memReg, memOffset, TEMP_GPR1.WReg);
 		if (indexed)
 			add(TEMP_GPR1.WReg, TEMP_GPR1.WReg, indexReg);
+		emitGuestAddressTranslate(*this);
 		fmov(TEMP_GPR2.WReg, dataSReg);
 		rev(TEMP_GPR2.WReg, TEMP_GPR2.WReg);
-		str(TEMP_GPR2.WReg, AdrExt(MEM_BASE_REG, TEMP_GPR1.WReg, ExtMod::UXTW));
+		withGuestMemAdr([&](const auto& adr) { str(TEMP_GPR2.WReg, adr); });
 	}
 	else
 	{
@@ -1676,7 +1724,8 @@ void AArch64GenContext_t::enterRecompilerCode()
 	st4((v12.d - v15.d)[0], AdrPostImm(x9, 32));
 	mov(HCPU_REG, x1); // call argument 2
 	mov(PPC_REC_INSTANCE_REG, (uint64)ppcRecompilerInstanceData);
-	mov(MEM_BASE_REG, (uint64)memory_base);
+	// linear mode: guest memory base. page table mode: address of the guest page -> host page table (see emitGuestAddressTranslate)
+	mov(MEM_BASE_REG, memory_isPageTableMode() ? (uint64)g_memoryPageTable : (uint64)memory_base);
 
 	// branch to recFunc
 	blr(x0); // call argument 1

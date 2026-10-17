@@ -1295,7 +1295,17 @@ void PPCRecompiler_init()
         PPCCore_InitializePointer(false);
         return;
     }
-    
+
+#if !defined(__aarch64__)
+    // the x64 backend addresses guest memory as memory_base + address and has no page table support
+    if (memory_isPageTableMode())
+    {
+        cemuLog_log(LogType::Force, "Recompiler disabled. Guest memory runs in page table mode which this recompiler backend does not support");
+        ppcRecompilerEnabled = false;
+        PPCCore_InitializePointer(false);
+        return;
+    }
+#endif
     
 #if defined(__APPLE__) && BOOST_OS_IOS
     if (!checkDebugged() && ActiveSettings::GetCPUMode() == CPUMode::Auto) {

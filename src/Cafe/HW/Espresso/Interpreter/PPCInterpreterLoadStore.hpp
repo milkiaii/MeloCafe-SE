@@ -64,7 +64,7 @@ static void PPCInterpreter_STWCX(PPCInterpreter_t* hCPU, uint32 Opcode)
 		std::atomic<uint32be>* wordPtr;		
 		if constexpr(ppcItpCtrl::allowSupervisorMode)
 		{
-			wordPtr = _rawPtrToAtomic((uint32be*)(memory_base + ppcItpCtrl::ppcMem_translateVirtualDataToPhysicalAddr(hCPU, ea)));
+			wordPtr = _rawPtrToAtomic((uint32be*)(memory_translate(ppcItpCtrl::ppcMem_translateVirtualDataToPhysicalAddr(hCPU, ea))));
 			DSI_EXIT();
 		}
 		else

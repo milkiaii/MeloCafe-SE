@@ -180,6 +180,7 @@ add_library(CemuCafe
   HW/Latte/Transcompiler/LatteTC.h
   HW/MMU/MMU.cpp
   HW/MMU/MMU.h
+  HW/MMU/MMUTranslate.h
   HW/SI/SI.cpp
   HW/SI/si.h
   HW/VI/VI.cpp

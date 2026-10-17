@@ -19,7 +19,7 @@ public:
     
     inline static uint32 memory_readCodeU32(PPCInterpreter_t* hCPU, uint32 address)
     {
-        return _swapEndianU32(*(uint32*)(memory_base + address));
+        return _swapEndianU32(*(uint32*)(memory_translate(address)));
     }
     
     inline static void ppcMem_writeDataDouble(PPCInterpreter_t* hCPU, uint32 address, double vf)
@@ -88,12 +88,12 @@ public:
     
     inline static uint64 ppcMem_readDataFloatEx(PPCInterpreter_t* hCPU, uint32 addr)
     {
-        return ConvertToDoubleNoFTZ(_swapEndianU32(*(uint32*)(memory_base + addr)));
+        return ConvertToDoubleNoFTZ(_swapEndianU32(*(uint32*)(memory_translate(addr))));
     }
     
     inline static void ppcMem_writeDataFloatEx(PPCInterpreter_t* hCPU, uint32 addr, uint64 value)
     {
-        *(uint32*)(memory_base + addr) = _swapEndianU32(ConvertToSingleNoFTZ(value));
+        *(uint32*)(memory_translate(addr)) = _swapEndianU32(ConvertToSingleNoFTZ(value));
     }
     
     inline static uint64 getTB(PPCInterpreter_t* hCPU)
@@ -210,7 +210,7 @@ public:
             uint32 ptegSelectLow = (lookupHash & 0x3FF);
             uint32 maskOR = (lookupHash >> 10) & pageTableMask;
 
-            uint32* pteg = (uint32*)(memory_base + (pageTableAddr | (maskOR << 16)) + ptegSelectLow * 64);
+            uint32* pteg = (uint32*)(memory_translate(pageTableAddr | (maskOR << 16)) + ptegSelectLow * 64);
             for (sint32 t = 0; t < 8; t++)
             {
                 uint32 w0 = _swapEndianU32(pteg[0]);
@@ -302,12 +302,12 @@ public:
 
     static uint32 memory_readCodeU32(PPCInterpreter_t* hCPU, uint32 address)
     {
-        return _swapEndianU32(*(uint32*)(memory_base + ppcMem_translateVirtualCodeToPhysicalAddr(hCPU, address)));
+        return _swapEndianU32(*(uint32*)(memory_translate(ppcMem_translateVirtualCodeToPhysicalAddr(hCPU, address))));
     }
 
     inline static uint8* ppcMem_getDataPtr(PPCInterpreter_t* hCPU, uint32 vAddr)
     {
-        return memory_base + ppcMem_translateVirtualDataToPhysicalAddr(hCPU, vAddr);
+        return memory_translate(ppcMem_translateVirtualDataToPhysicalAddr(hCPU, vAddr));
     }
 
     inline static void ppcMem_writeDataDouble(PPCInterpreter_t* hCPU, uint32 address, double vf)
@@ -333,7 +333,7 @@ public:
             cemu_assert_unimplemented();
             return;
         }
-        *(uint32*)(memory_base + pAddr) = CPU_swapEndianU32(v);
+        *(uint32*)(memory_translate(pAddr)) = CPU_swapEndianU32(v);
     }
 
     inline static void ppcMem_writeDataU16(PPCInterpreter_t* hCPU, uint32 address, uint16 v)
@@ -387,7 +387,7 @@ public:
             cemu_assert_unimplemented();
             return 0;
         }
-        uint32 v = *(uint32*)(memory_base + pAddr);
+        uint32 v = *(uint32*)(memory_translate(pAddr));
         return CPU_swapEndianU32(v);
     }
 
@@ -405,17 +405,17 @@ public:
             cemu_assert_unimplemented();
             return 0;
         }
-        return *(uint8*)(memory_base + pAddr);
+        return *(uint8*)(memory_translate(pAddr));
     }
 
     inline static uint64 ppcMem_readDataFloatEx(PPCInterpreter_t* hCPU, uint32 addr)
     {
-        return ConvertToDoubleNoFTZ(_swapEndianU32(*(uint32*)(memory_base + addr)));
+        return ConvertToDoubleNoFTZ(_swapEndianU32(*(uint32*)(memory_translate(addr))));
     }
 
     inline static void ppcMem_writeDataFloatEx(PPCInterpreter_t* hCPU, uint32 addr, uint64 value)
     {
-        *(uint32*)(memory_base + addr) = _swapEndianU32(ConvertToSingleNoFTZ(value));
+        *(uint32*)(memory_translate(addr)) = _swapEndianU32(ConvertToSingleNoFTZ(value));
     }
 
     inline static uint64 getTB(PPCInterpreter_t* hCPU)

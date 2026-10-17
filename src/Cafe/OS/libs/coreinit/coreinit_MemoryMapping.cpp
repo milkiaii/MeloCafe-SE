@@ -120,6 +120,11 @@ namespace coreinit
 			return 0;
 		}
 
+		if (!memory_isGuestRangeReserved(virtualAddress, size))
+		{
+			cemuLog_log(LogType::Force, "OSMapMemory: Virtual address range {:08x}-{:08x} is not backed by reserved host memory (page table mode)", virtualAddress, virtualAddress + size);
+			return 0;
+		}
 		uint8* virtualPtr = memory_getPointerFromVirtualOffset(virtualAddress);
 
 		MemMapper::PAGE_PERMISSION pageProtect = MemMapper::PAGE_PERMISSION::P_NONE;
@@ -144,6 +149,8 @@ namespace coreinit
 			cemu_assert_suspicious();
 
 		cemu_assert((size % MemMapper::GetPageSize()) == 0);
+		if (!memory_isGuestRangeReserved(virtualAddress, size))
+			return 0;
 
 		uint8* virtualPtr = memory_getPointerFromVirtualOffset(virtualAddress);
 

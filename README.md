@@ -10,6 +10,17 @@ MeloCafe is currently only available for iOS/iPadOS platforms.
  - [Official Website](https://melo.cafe)
  - [Official Discord](https://discord.gg/HjCDPTpC3W)
 
+### Low-memory devices (page table mode)
+
+MeloCafe normally reserves one contiguous 4GiB block of address space for the Wii U memory map. If that reservation
+fails (for example on 3GB devices such as the iPhone SE), it automatically falls back to *page table mode*: only the
+~1.9GiB of guest ranges that actually exist are reserved, and guest accesses go through a page table.
+The AArch64 recompiler supports this mode too, at a small cost per memory access.
+
+- `MELOCAFE_PAGETABLE=1` forces page table mode (useful for testing on devices where the 4GiB reservation works).
+- `MELOCAFE_PAGETABLE=0` disables the automatic fallback.
+- Limitations: graphic packs that enlarge RAM ranges and the overlay arena (448MiB) may be unavailable in this mode.
+
 #### Other relevant repositories:
  - [Cemu's Community Graphic Packs](https://github.com/cemu-project/cemu_graphic_packs)
 
