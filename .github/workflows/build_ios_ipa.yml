@@ -113,6 +113,17 @@ jobs:
           path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
           key: ${{ steps.vcpkg-key.outputs.key }}-${{ github.run_id }}
 
+      # ZArchive, ih264d and xbyak_aarch64 are EXCLUDE_FROM_ALL sub-projects that the app's Xcode project does not build by itself,
+      # but CemuBin links their .a files from the CMake output directories, so build them first.
+      - name: Build bundled static libraries
+        run: |
+          set -o pipefail
+          cmake --build build --config "$CONFIGURATION" --target zarchive ih264d xbyak_aarch64 -- \
+            -sdk iphoneos \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            LLVM_LTO="$ENABLE_LTO" 2>&1 | tee build/xcodebuild.log
+          find build -name 'libzarchive.a' -o -name 'libih264d.a' -o -name 'libxbyak_aarch64.a'
+
       - name: Build MeloCafe.app
         run: |
           set -o pipefail
@@ -138,7 +149,7 @@ jobs:
             PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
             LLVM_LTO="$ENABLE_LTO" \
             SWIFT_ACTIVE_COMPILATION_CONDITIONS="$SWIFT_CONDITIONS" \
-            build 2>&1 | tee build/xcodebuild.log
+            build 2>&1 | tee -a build/xcodebuild.log
 
       - name: Package unsigned IPA
         run: |
