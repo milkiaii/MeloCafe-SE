@@ -311,9 +311,18 @@ if(CEMU_ARCHITECTURE MATCHES "(aarch64)|(AARCH64)|(arm64)|(ARM64)")
 	add_subdirectory("dependencies/xbyak_aarch64" EXCLUDE_FROM_ALL)
 endif()
 
+if (IOS)
+	# CMake makes every executable an app bundle on iOS, which breaks the install() rules of ZArchive's command line tool
+	# ("install TARGETS given no BUNDLE DESTINATION for MACOSX_BUNDLE executable target zarchiveTool")
+	set(CEMU_PREV_MACOSX_BUNDLE "${CMAKE_MACOSX_BUNDLE}")
+	set(CMAKE_MACOSX_BUNDLE OFF)
+endif()
 find_package(ZArchive QUIET)
 if (NOT ZArchive_FOUND)
 	add_subdirectory("dependencies/ZArchive" EXCLUDE_FROM_ALL)
+endif()
+if (IOS)
+	set(CMAKE_MACOSX_BUNDLE "${CEMU_PREV_MACOSX_BUNDLE}")
 endif()
 
 add_subdirectory(src)

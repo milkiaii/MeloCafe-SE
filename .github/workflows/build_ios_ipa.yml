@@ -183,9 +183,16 @@ jobs:
           temp = os.environ["RUNNER_TEMP"]
           report("CMake configure output (tail)", f"{temp}/configure.log", 60)
           report("vcpkg manifest install log (tail)", "build/vcpkg-manifest-install.log", 40)
-          errlogs = sorted(glob.glob("dependencies/vcpkg/buildtrees/*/*-err.log") + glob.glob("dependencies/vcpkg/buildtrees/*/*.log"), key=os.path.getmtime, reverse=True)
+          errlogs = sorted(glob.glob("dependencies/vcpkg/buildtrees/*/*-err.log"), key=os.path.getmtime, reverse=True)
           for path in errlogs[:3]:
               report(f"vcpkg log {os.path.relpath(path, 'dependencies/vcpkg/buildtrees')} (tail)", path, 40)
+          try:
+              with open("build/xcodebuild.log", errors="replace") as f:
+                  hits = [l.rstrip() for l in f if "error:" in l or "error build" in l or "ld: " in l or "Undefined symbols" in l]
+              if hits:
+                  print(f"::error title=xcodebuild errors::{esc(chr(10).join(hits[:40])[-6000:])}")
+          except OSError:
+              pass
           report("xcodebuild output (tail)", "build/xcodebuild.log", 60)
 
       - name: Upload build logs
