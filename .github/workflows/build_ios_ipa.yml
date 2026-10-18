@@ -116,6 +116,14 @@ jobs:
       - name: Build MeloCafe.app
         run: |
           set -o pipefail
+          # The app uses an iOS 27 only API (external display accessory scene). GitHub's runners only have Xcode 26 (iOS 26 SDK),
+          # so compile that part out when the SDK is older than 27 (see MeloCafeApp.swift).
+          SDK_MAJOR="$(xcrun --sdk iphoneos --show-sdk-version | cut -d. -f1)"
+          SWIFT_CONDITIONS='$(inherited)'
+          if [ "$SDK_MAJOR" -lt 27 ]; then
+            echo "iOS SDK $SDK_MAJOR detected -> building without the iOS 27 only code (NO_IOS27_SDK)"
+            SWIFT_CONDITIONS='$(inherited) NO_IOS27_SDK'
+          fi
           xcodebuild \
             -project MeloCafe/MeloCafe.xcodeproj \
             -scheme MeloCafe \
@@ -129,6 +137,7 @@ jobs:
             DEVELOPMENT_TEAM="" \
             PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
             LLVM_LTO="$ENABLE_LTO" \
+            SWIFT_ACTIVE_COMPILATION_CONDITIONS="$SWIFT_CONDITIONS" \
             build 2>&1 | tee build/xcodebuild.log
 
       - name: Package unsigned IPA
