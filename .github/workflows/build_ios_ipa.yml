@@ -95,13 +95,14 @@ jobs:
       # vcpkg builds all third party libraries (boost, openssl, sdl3, glslang, ...) for arm64-ios during this step
       - name: Configure (CMake, Xcode generator, iOS)
         run: |
+          set -o pipefail
           cmake -S . -B build -G Xcode \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT=iphoneos \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DBUILD_HEADLESS_DYLIB=ON \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
-            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO 2>&1 | tee "$RUNNER_TEMP/configure.log"
           # the app project references this generated project (see MeloCafe.xcodeproj -> ../build/src/cemuMain.xcodeproj)
           test -d build/src/cemuMain.xcodeproj
 
@@ -156,6 +157,37 @@ jobs:
           path: artifacts/MeloCafe-SE-unsigned.ipa
           if-no-files-found: error
 
+      # Puts the interesting part of the logs into check-run annotations (visible on the run summary page and via the API)
+      - name: Report errors
+        if: failure()
+        shell: python3 {0}
+        run: |
+          import glob, os
+
+          def esc(text):
+              return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+          def tail(path, lines, limit=6000):
+              try:
+                  with open(path, errors="replace") as f:
+                      data = "".join(f.readlines()[-lines:])
+              except OSError:
+                  return None
+              return data[-limit:]
+
+          def report(title, path, lines=50):
+              data = tail(path, lines)
+              if data:
+                  print(f"::error title={title}::{esc(data)}")
+
+          temp = os.environ["RUNNER_TEMP"]
+          report("CMake configure output (tail)", f"{temp}/configure.log", 60)
+          report("vcpkg manifest install log (tail)", "build/vcpkg-manifest-install.log", 40)
+          errlogs = sorted(glob.glob("dependencies/vcpkg/buildtrees/*/*-err.log") + glob.glob("dependencies/vcpkg/buildtrees/*/*.log"), key=os.path.getmtime, reverse=True)
+          for path in errlogs[:3]:
+              report(f"vcpkg log {os.path.relpath(path, 'dependencies/vcpkg/buildtrees')} (tail)", path, 40)
+          report("xcodebuild output (tail)", "build/xcodebuild.log", 60)
+
       - name: Upload build logs
         if: failure()
         uses: actions/upload-artifact@v4
@@ -163,6 +195,7 @@ jobs:
           name: build-logs
           path: |
             build/xcodebuild.log
+            ${{ runner.temp }}/configure.log
             build/vcpkg-manifest-install.log
             build/CMakeFiles/CMakeConfigureLog.yaml
             dependencies/vcpkg/buildtrees/*/*.log
