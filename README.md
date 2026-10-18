@@ -21,6 +21,20 @@ The AArch64 recompiler supports this mode too, at a small cost per memory access
 - `MELOCAFE_PAGETABLE=0` disables the automatic fallback.
 - Limitations: graphic packs that enlarge RAM ranges and the overlay arena (448MiB) may be unavailable in this mode.
 
+### Building an IPA without a Mac
+
+The `Build iOS IPA (unsigned)` GitHub Actions workflow (`.github/workflows/build_ios_ipa.yml`) builds MeloCafe on a hosted
+Mac and uploads `MeloCafe-SE-unsigned.ipa` as an artifact.
+
+1. Open the **Actions** tab of your fork, pick **Build iOS IPA (unsigned)** and click **Run workflow** (pushes to the
+   `page-table-fallback` branch also trigger it). The first run builds all dependencies with vcpkg and can take a long
+   time; later runs reuse the cache.
+2. Download the `MeloCafe-SE-unsigned-ipa` artifact from the finished run and unzip it.
+3. Sign and install the `.ipa` with SideStore, Sideloadly, Impactor or similar, then enable JIT as described above.
+
+Devices that cannot reserve 4GiB of address space (like the 3GB iPhone SE) switch to page table mode automatically,
+check the app log for the `Page table mode:` lines to confirm.
+
 #### Other relevant repositories:
  - [Cemu's Community Graphic Packs](https://github.com/cemu-project/cemu_graphic_packs)
 

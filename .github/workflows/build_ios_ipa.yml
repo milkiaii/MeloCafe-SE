@@ -1,0 +1,169 @@
+name: Build iOS IPA (unsigned)
+
+# Builds MeloCafe for iPhone on a GitHub-hosted Mac and uploads an UNSIGNED .ipa as a workflow artifact.
+# Sign/install it on your phone with SideStore, Sideloadly, Impactor, AltStore, etc. (no Mac needed).
+#
+# Run it from the "Actions" tab -> "Build iOS IPA (unsigned)" -> "Run workflow",
+# or just push to the page-table-fallback branch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "Xcode build configuration"
+        type: choice
+        options:
+          - Release
+          - Debug
+        default: Release
+      lto:
+        description: "Enable full LTO (smaller/faster app but much slower and memory hungry build; can fail on runners)"
+        type: boolean
+        default: false
+      bundle_id:
+        description: "Bundle identifier baked into the IPA (your sideload tool will usually rewrite it)"
+        type: string
+        default: "com.melocafe.se.MeloCafe"
+  push:
+    branches:
+      - page-table-fallback
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VCPKG_ROOT: "${{ github.workspace }}/dependencies/vcpkg"
+  VCPKG_DEFAULT_BINARY_CACHE: "${{ github.workspace }}/.vcpkg-binary-cache"
+  VCPKG_DISABLE_METRICS: "1"
+  CONFIGURATION: ${{ inputs.configuration || 'Release' }}
+  ENABLE_LTO: ${{ inputs.lto && 'YES' || 'NO' }}
+  BUNDLE_ID: ${{ inputs.bundle_id || 'com.melocafe.se.MeloCafe' }}
+
+jobs:
+  build-ipa:
+    name: build-ios-ipa
+    # The Xcode project needs Xcode 26 (Icon Composer .icon assets), which ships on the macos-26 image.
+    runs-on: macos-26
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0 # vcpkg needs its full history to resolve the builtin-baseline
+
+      - name: Select Xcode 26
+        run: |
+          XCODE="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [ -n "$XCODE" ]; then
+            sudo xcode-select -s "$XCODE"
+          fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install build tools
+        run: |
+          brew update
+          brew install nasm automake autoconf libtool pkgconf ninja ldid
+          cmake --version
+
+      - name: Compute vcpkg cache key
+        id: vcpkg-key
+        run: |
+          VCPKG_HEAD="$(git -C dependencies/vcpkg rev-parse HEAD)"
+          INPUTS_HASH="$(cat vcpkg.json triplets/*.cmake | shasum -a 256 | cut -c1-16)"
+          OVERLAY_HASH="$(find dependencies/vcpkg_overlay_ports dependencies/vcpkg_overlay_ports_mac -type f | sort | xargs shasum -a 256 | shasum -a 256 | cut -c1-16)"
+          echo "key=vcpkg-ios-${VCPKG_HEAD:0:10}-${INPUTS_HASH}-${OVERLAY_HASH}" >> "$GITHUB_OUTPUT"
+
+      # restore + save (instead of one cache step) so a failed first build still keeps the dependencies it managed to compile
+      - name: Restore vcpkg binary cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: ${{ steps.vcpkg-key.outputs.key }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ steps.vcpkg-key.outputs.key }}-
+            vcpkg-ios-
+
+      - name: Bootstrap vcpkg
+        run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          ./dependencies/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+      # vcpkg builds all third party libraries (boost, openssl, sdl3, glslang, ...) for arm64-ios during this step
+      - name: Configure (CMake, Xcode generator, iOS)
+        run: |
+          cmake -S . -B build -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DBUILD_HEADLESS_DYLIB=ON \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO
+          # the app project references this generated project (see MeloCafe.xcodeproj -> ../build/src/cemuMain.xcodeproj)
+          test -d build/src/cemuMain.xcodeproj
+
+      - name: Save vcpkg binary cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: ${{ steps.vcpkg-key.outputs.key }}-${{ github.run_id }}
+
+      - name: Build MeloCafe.app
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project MeloCafe/MeloCafe.xcodeproj \
+            -scheme MeloCafe \
+            -configuration "$CONFIGURATION" \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            LLVM_LTO="$ENABLE_LTO" \
+            build 2>&1 | tee build/xcodebuild.log
+
+      - name: Package unsigned IPA
+        run: |
+          APP="$(find build/DerivedData/Build/Products -maxdepth 2 -name 'MeloCafe.app' -type d | head -n 1)"
+          test -n "$APP" || { echo "MeloCafe.app not found"; exit 1; }
+          echo "App bundle: $APP"
+          ls "$APP" "$APP/Frameworks" || true
+
+          # Embed the entitlements (increased memory limit) with a fake signature. Sideloading tools re-sign the app but
+          # keep the entitlements they find, and an unsigned build would otherwise have none.
+          ENTITLEMENTS="MeloCafe/MeloCafe/MeloCafe.entitlements"
+          EXEC="$APP/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
+          ldid -S"$ENTITLEMENTS" "$EXEC" || echo "::warning::ldid could not embed entitlements; the IPA is still unsigned and installable"
+
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP" Payload/
+          mkdir -p artifacts
+          zip -qry "artifacts/MeloCafe-SE-unsigned.ipa" Payload
+          ls -lh artifacts
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeloCafe-SE-unsigned-ipa
+          path: artifacts/MeloCafe-SE-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build/xcodebuild.log
+            build/vcpkg-manifest-install.log
+            build/CMakeFiles/CMakeConfigureLog.yaml
+            dependencies/vcpkg/buildtrees/*/*.log
+          if-no-files-found: ignore
