@@ -45,6 +45,8 @@ static bool memory_reserveSparseRange(uintptr_t base, uint64_t offset, uint64_t 
 // Only the guest ranges that exist are reserved, packed back to back into one smaller arena. Guest accesses go through
 // g_memoryPageTable (see MMUTranslate.h) instead of memory_base + address.
 // ---------------------------------------------------------------------------------------------
+extern std::vector<struct MMURange*> g_mmuRanges; // defined further down
+
 uint8** g_memoryPageTable = nullptr;
 uint32* g_memoryReverseTable = nullptr;
 uint8* g_memoryArenaBase = nullptr;
