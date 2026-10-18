@@ -2,6 +2,7 @@
 #include "Cafe/HW/MMU/MMUTranslate.h"
 
 void memory_init();
+void memory_logFreeAddressSpace(const char* label);
 void memory_mapForCurrentTitle();
 void memory_unmapForCurrentTitle();
 void memory_logModifiedMemoryRanges();

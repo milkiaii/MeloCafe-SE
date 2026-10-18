@@ -1,5 +1,8 @@
 #pragma once
 
+#include <utility>
+#include <vector>
+
 namespace MemMapper
 {
 	enum class PAGE_PERMISSION : uint32
@@ -21,4 +24,13 @@ namespace MemMapper
 
 	void* AllocateMemory(void* baseAddr, size_t size, PAGE_PERMISSION permissionFlags, bool fromReservation = false);
 	void FreeMemory(void* baseAddr, size_t size, bool fromReservation = false);
+
+	struct FreeAddressSpaceInfo
+	{
+		size_t largestBlockBytes{};
+		size_t totalBytes{}; // capped by the cap passed to ProbeFreeAddressSpace
+		std::vector<std::pair<size_t, size_t>> blocks; // (block size in bytes, count) from large to small
+	};
+	// Measures how much address space can still be reserved. Everything reserved for the probe is released again before returning.
+	FreeAddressSpaceInfo ProbeFreeAddressSpace(size_t capBytes = size_t{16} * 1024 * 1024 * 1024);
 };

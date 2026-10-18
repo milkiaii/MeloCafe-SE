@@ -48,6 +48,7 @@ add_library(CemuUtil
   math/vector2.h
   math/vector3.h
   MemMapper/MemMapper.h
+  MemMapper/MemMapperProbe.cpp
   SystemInfo/SystemInfo.cpp
   SystemInfo/SystemInfo.h
   ThreadPool/ThreadPool.h

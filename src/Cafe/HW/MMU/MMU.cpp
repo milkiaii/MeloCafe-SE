@@ -311,8 +311,21 @@ MMURange mmuRange_CORE1_LC				{ 0xFFC40000, 0x00005000, MMU_MEM_AREA_ID::CPU_LC1
 MMURange mmuRange_CORE2_LC				{ 0xFFC80000, 0x00005000, MMU_MEM_AREA_ID::CPU_LC2, "CORE2_LC" }; // locked L2 cache of core 2
 MMURange mmuRange_HIGHMEM				{ 0xFFFFF000, 0x00001000, MMU_MEM_AREA_ID::CPU_PER_CORE, "PER-CORE" }; // per-core memory? Used by coreinit and PPC kernel to store core context specific data (like current thread ptr). We dont use it but Project Zero has a bug where it writes a byte at 0xfffffffe thus this memory range needs to be writable
 
+// Logs how much address space this process can still reserve. Helps to tune reservations on devices with a small address space budget.
+void memory_logFreeAddressSpace(const char* label)
+{
+#if BOOST_OS_IOS
+	const MemMapper::FreeAddressSpaceInfo info = MemMapper::ProbeFreeAddressSpace();
+	std::string blocks;
+	for (const auto& block : info.blocks)
+		blocks += fmt::format("{}x{}MiB ", block.second, block.first >> 20);
+	cemuLog_log(LogType::Force, "Address space ({}): largest free block {} MiB, total reservable {} MiB (cap 16 GiB) [{}]", label, info.largestBlockBytes >> 20, info.totalBytes >> 20, blocks);
+#endif
+}
+
 void memory_init()
 {
+	memory_logFreeAddressSpace("before guest memory reservation");
 	const int pageTableOverride = memory_getPageTableOverride();
 	if (!memory_base && pageTableOverride != 1)
 		memory_base = (uint8*)MemMapper::ReserveMemory(nullptr, size_t{0x100000000ULL}, MemMapper::PAGE_PERMISSION::P_RW);
@@ -367,6 +380,7 @@ void memory_init()
 		WindowSystem::ShowErrorDialog(_tr("Unable to reserve guest memory regions"), _tr("Error"));
 		exit(-1);
 	}
+	memory_logFreeAddressSpace("after guest memory reservation");
 	for (auto& itr : g_mmuRanges)
 	{
 		if (itr->isMappedEarly())

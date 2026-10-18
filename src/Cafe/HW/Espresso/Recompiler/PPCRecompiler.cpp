@@ -42,6 +42,7 @@
 #include "BackendAArch64/BackendAArch64.h"
 #endif
 #include "util/highresolutiontimer/HighResolutionTimer.h"
+#include "Cafe/HW/MMU/MMU.h"
 
 #ifndef PPCREC_FORCE_SYNCHRONOUS_COMPILATION
 #if defined(__aarch64__)
@@ -272,6 +273,10 @@ void PPCRecompiler_flushInstructionCache(void* codePtr, size_t codeSize)
 #endif
 }
 
+// Set while the JIT arena has no free range left. Compilation requests are skipped (the interpreter runs the code) instead of generating
+// code that would be thrown away. Cleared again as soon as functions are released and space is available.
+static std::atomic<bool> s_jitArenaFull{false};
+
 struct DualMapArena
 {
     DualMapRegion region;
@@ -291,6 +296,22 @@ struct DualMapArena
         cemuLog_log(LogType::Force, "JIT arena: rw={:p} rx={:p} size={}MB",
             region.rwAlias, region.rxAlias, size / 1024 / 1024);
         return true;
+    }
+
+    // Tries `preferred` first and halves the size until the mapping succeeds or `minimum` is reached.
+    // The arena needs two aliases (rx + rw) of the same size, so it costs twice its size in address space.
+    bool initWithFallback(size_t preferred, size_t minimum)
+    {
+        for (size_t size = preferred; size >= minimum; size /= 2)
+        {
+            if (init(size))
+            {
+                if (size != preferred)
+                    cemuLog_log(LogType::Force, "JIT arena: using reduced size of {}MB (wanted {}MB), address space is limited", size / 1024 / 1024, preferred / 1024 / 1024);
+                return true;
+            }
+        }
+        return false;
     }
 
     DualMapRegion alloc(size_t size)
@@ -314,7 +335,8 @@ struct DualMapArena
             }
             return {(uint8*)region.rwAlias + pos, (uint8*)region.rxAlias + pos, size};
         }
-        cemuLog_log(LogType::Force, "JIT arena: no free range for {} bytes", size);
+        if (!s_jitArenaFull.exchange(true))
+            cemuLog_log(LogType::Force, "JIT arena: full (no free range for {} bytes). Code that is not compiled yet runs in the interpreter until space is freed", size);
         return {};
     }
 
@@ -324,6 +346,7 @@ struct DualMapArena
             return;
         const size_t pos = (uint8*)allocation.rwAlias - (uint8*)region.rwAlias;
         cemu_assert(pos <= region.size && allocation.size <= region.size - pos);
+        s_jitArenaFull = false; // space is available again
         std::lock_guard lock(mutex);
         auto next = freeRanges.lower_bound(pos);
         cemu_assert(next == freeRanges.end() || pos + allocation.size <= next->first);
@@ -427,6 +450,8 @@ void PPCRecompiler_recompileAtAddress(uint32 address);
 
 void PPCRecompiler_visitAddressNoBlock(uint32 enterAddress)
 {
+    if (s_jitArenaFull.load(std::memory_order_relaxed))
+        return; // no room for more code, keep interpreting
 #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
     if (ppcRecompilerInstanceData->ppcRecompilerDirectJumpTable[enterAddress / 4] != PPCRecompiler_leaveRecompilerCode_unvisited)
         return;
@@ -1239,7 +1264,7 @@ bool PPCRecompiler_Init26() {
     
     try
     {
-        if (!s_jitArena.init(1024 * 1024 * 1024))
+        if (!s_jitArena.initWithFallback(1024 * 1024 * 1024, 64 * 1024 * 1024))
         {
             cemuLog_log(LogType::Force, "JIT arena allocation failed, disabling JIT");
             ppcRecompilerEnabled = false;
@@ -1251,6 +1276,7 @@ bool PPCRecompiler_Init26() {
             g_jitArenaRxEnd  = (uint8*)s_jitArena.region.rxAlias + s_jitArena.region.size;
             g_jitArenaRwBase = s_jitArena.region.rwAlias;
             ppcRecompilerInited = true;
+            memory_logFreeAddressSpace("after JIT arena allocation");
             
             if (ppcRecompilerInstanceData)
             {
@@ -1350,6 +1376,15 @@ void PPCRecompiler_init()
     if (s_dualMapJITEnabled && !ppcRecompilerInited)
     {
         init26 = PPCRecompiler_Init26();
+        if (!init26)
+        {
+            // Without the JIT arena no function can be placed, so the recompiler would only burn CPU generating code it cannot use. Stay on the interpreter.
+            cemuLog_log(LogType::Force, "Recompiler unavailable (JIT arena could not be set up), using the interpreter");
+            memory_logFreeAddressSpace("after JIT arena failure");
+            ppcRecompilerEnabled = false;
+            PPCCore_InitializePointer(false);
+            return;
+        }
     }
     
     if (!init26) {
