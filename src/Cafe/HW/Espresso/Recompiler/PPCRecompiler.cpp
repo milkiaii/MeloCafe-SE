@@ -26,11 +26,19 @@
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <sys/sysctl.h>
+#include <mach/task_info.h>
+#include <mach/mach_init.h>
+#if __has_include(<os/proc.h>)
+#include <os/proc.h>
+#endif
 #endif
 #endif
 
 #include "IML/IML.h"
 
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <map>
 #include <mutex>
 #include <limits>
@@ -44,12 +52,9 @@
 #include "util/highresolutiontimer/HighResolutionTimer.h"
 #include "Cafe/HW/MMU/MMU.h"
 
+// Compilation runs on the worker thread pool. Set MELOCAFE_JIT_SYNC=1 to compile on the emulation threads instead (debugging aid).
 #ifndef PPCREC_FORCE_SYNCHRONOUS_COMPILATION
-#if defined(__aarch64__)
-#define PPCREC_FORCE_SYNCHRONOUS_COMPILATION    1
-#else
 #define PPCREC_FORCE_SYNCHRONOUS_COMPILATION    0
-#endif
 #endif
 #define PPCREC_LOG_RECOMPILATION_RESULTS        0
 
@@ -277,6 +282,18 @@ void PPCRecompiler_flushInstructionCache(void* codePtr, size_t codeSize)
 // code that would be thrown away. Cleared again as soon as functions are released and space is available.
 static std::atomic<bool> s_jitArenaFull{false};
 
+// ---- statistics, logged periodically by the stats thread (see PPCRecompiler_startStatsThread) ----
+static std::atomic<uint64> s_statCompiled{0};
+static std::atomic<uint64> s_statCompileFailed{0};
+static std::atomic<uint64> s_statCompileNs{0};
+static std::atomic<uint64> s_statCompileMaxNs{0};
+static std::atomic<uint64> s_statInvalidations{0};
+static std::atomic<uint64> s_statInvalidatedBytes{0};
+static std::atomic<uint64> s_statDeleted{0};
+static std::atomic<uint64> s_statActivated{0};
+static std::atomic<uint64> s_statDiscarded{0};
+static bool s_syncCompile = false; // MELOCAFE_JIT_SYNC=1
+
 struct DualMapArena
 {
     DualMapRegion region;
@@ -312,6 +329,15 @@ struct DualMapArena
             }
         }
         return false;
+    }
+
+    size_t freeBytes()
+    {
+        std::lock_guard lock(mutex);
+        size_t total = 0;
+        for (auto& it : freeRanges)
+            total += it.second;
+        return total;
     }
 
     DualMapRegion alloc(size_t size)
@@ -438,9 +464,7 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
 
 PPCRecompilerInstanceData_t* ppcRecompilerInstanceData;
 
-#if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
 static std::mutex s_singleRecompilationMutex;
-#endif
 
 bool ppcRecompilerEnabled = false;
 bool ppcRecompilerInited = false;
@@ -452,7 +476,8 @@ void PPCRecompiler_visitAddressNoBlock(uint32 enterAddress)
 {
     if (s_jitArenaFull.load(std::memory_order_relaxed))
         return; // no room for more code, keep interpreting
-#if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
+    if (s_syncCompile)
+    {
     if (ppcRecompilerInstanceData->ppcRecompilerDirectJumpTable[enterAddress / 4] != PPCRecompiler_leaveRecompilerCode_unvisited)
         return;
     PPCRecompilerState.recompilerSpinlock.lock();
@@ -468,7 +493,7 @@ void PPCRecompiler_visitAddressNoBlock(uint32 enterAddress)
         PPCRecompiler_recompileAtAddress(enterAddress);
     s_singleRecompilationMutex.unlock();
     return;
-#endif
+    }
     if (ppcRecompilerInstanceData->ppcRecompilerDirectJumpTable[enterAddress / 4] != PPCRecompiler_leaveRecompilerCode_unvisited)
         return;
     if (!PPCRecompilerState.recompilerSpinlock.try_lock())
@@ -977,13 +1002,28 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
 	PPCRecompilerState.recompilerSpinlock.unlock();
 
 	std::vector<std::pair<MPTR, uint32>> functionEntryPoints;
+	const auto statStart = std::chrono::steady_clock::now();
 	auto func = PPCRecompiler_recompileFunction(range, entryAddresses, functionEntryPoints, funcBoundaries);
+	{
+		const uint64 ns = (uint64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - statStart).count();
+		s_statCompileNs += ns;
+		uint64 prevMax = s_statCompileMaxNs.load();
+		while (ns > prevMax && !s_statCompileMaxNs.compare_exchange_weak(prevMax, ns)) {}
+		if (func)
+			s_statCompiled++;
+		else
+			s_statCompileFailed++;
+	}
 
 	if (!func)
 	{
 		return; // recompilation failed
 	}
 	bool r = PPCRecompiler_makeRecompiledFunctionActive(address, range, func, functionEntryPoints);
+	if (r)
+		s_statActivated++;
+	else
+		s_statDiscarded++; // invalidated while it was being compiled
 }
 
 
@@ -1125,6 +1165,7 @@ void PPCRecompiler_invalidateTableRange(uint32 offset, uint32 size)
 void PPCRecompiler_deleteFunction(PPCRecFunction_t* func)
 {
     cemu_assert_debug(PPCRecompilerState.recompilerSpinlock.is_locked());
+    s_statDeleted++;
     for (auto& r : func->list_ranges)
     {
         PPCRecompiler_invalidateTableRange(r.ppcAddress, r.ppcSize);
@@ -1151,6 +1192,8 @@ void PPCRecompiler_invalidateRangeInternal(uint32 startAddr, uint32 endAddr)
 	if (startAddr >= PPC_REC_CODE_AREA_SIZE)
 		return;
 	cemu_assert_debug(endAddr >= startAddr);
+	s_statInvalidations++;
+	s_statInvalidatedBytes += (uint64)(endAddr - startAddr);
 
 	PPCRecompilerState.recompilerSpinlock.lock();
 
@@ -1314,6 +1357,67 @@ bool PPCRecompiler_Init26() {
     return ppcRecompilerInited;
 }
 
+
+// ---- periodic statistics ----
+static std::thread s_statsThread;
+static std::atomic<bool> s_statsStop{false};
+
+static void PPCRecompiler_getMemoryStats(uint64& footprintMB, uint64& availableMB)
+{
+    footprintMB = 0;
+    availableMB = 0;
+#if defined(__APPLE__)
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) == KERN_SUCCESS)
+        footprintMB = (uint64)info.phys_footprint >> 20;
+#if BOOST_OS_IOS
+    availableMB = (uint64)os_proc_available_memory() >> 20;
+#endif
+#endif
+}
+
+static void PPCRecompiler_statsThreadFunc()
+{
+    uint64 lastCompiled = 0, lastInval = 0, lastNs = 0;
+    while (!s_statsStop.load())
+    {
+        for (int i = 0; i < 50 && !s_statsStop.load(); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (s_statsStop.load())
+            break;
+        size_t queued;
+        PPCRecompilerState.recompilerSpinlock.lock();
+        queued = PPCRecompilerState.targetQueue.size();
+        PPCRecompilerState.recompilerSpinlock.unlock();
+        const uint64 compiled = s_statCompiled.load(), inval = s_statInvalidations.load(), ns = s_statCompileNs.load();
+        uint64 footprintMB, availableMB;
+        PPCRecompiler_getMemoryStats(footprintMB, availableMB);
+        const size_t arenaTotal = s_jitArena.region.size, arenaFree = s_jitArena.freeBytes();
+        cemuLog_log(LogType::Force, "[JIT stats] compiled {} (+{} in 5s, {:.1f}ms avg, {:.0f}ms max) failed {} discarded {} deleted {} | invalidations {} (+{}, {} KiB) | queue {} | arena {}/{} MiB used{} | mem footprint {} MiB, available {} MiB",
+            compiled, compiled - lastCompiled, compiled ? (double)ns / compiled / 1e6 : 0.0, (double)s_statCompileMaxNs.load() / 1e6,
+            s_statCompileFailed.load(), s_statDiscarded.load(), s_statDeleted.load(),
+            inval, inval - lastInval, s_statInvalidatedBytes.load() >> 10, queued,
+            (arenaTotal - arenaFree) >> 20, arenaTotal >> 20, s_jitArenaFull.load() ? " FULL" : "", footprintMB, availableMB);
+        lastCompiled = compiled; lastInval = inval; lastNs = ns;
+    }
+}
+
+static void PPCRecompiler_startStatsThread()
+{
+    if (s_statsThread.joinable())
+        return;
+    s_statsStop = false;
+    s_statsThread = std::thread(PPCRecompiler_statsThreadFunc);
+}
+
+static void PPCRecompiler_stopStatsThread()
+{
+    s_statsStop = true;
+    if (s_statsThread.joinable())
+        s_statsThread.join();
+}
+
 void PPCRecompiler_init()
 {
     s_recompilerEnableCount = 0;
@@ -1354,6 +1458,8 @@ void PPCRecompiler_init()
     
     
     s_dualMapJITEnabled = PPCRecompiler_readDualMapEnvVar();
+    s_syncCompile = PPCRecompiler_readBoolEnvVar("MELOCAFE_JIT_SYNC") == 1 || PPCREC_FORCE_SYNCHRONOUS_COMPILATION;
+    cemuLog_log(LogType::Force, "Recompiler: compiling on {}", s_syncCompile ? "the emulation threads (synchronous)" : "worker threads");
     
 #if defined(__APPLE__) && defined(__aarch64__)
     const int appleOsMajorVersion = PPCRecompiler_getAppleOsMajorVersion();
@@ -1427,8 +1533,9 @@ void PPCRecompiler_init()
     PPCCore_InitializePointer(ppcRecompilerEnabled);
     ppcRecompilerInited = true;
     
-    s_threadPool.Start();
-    
+    if (!s_syncCompile)
+        s_threadPool.Start();
+    PPCRecompiler_startStatsThread();
     
     PPCRecompiler_finishJitMappingSession();
 
@@ -1436,6 +1543,7 @@ void PPCRecompiler_init()
 
 void PPCRecompiler_Shutdown()
 {
+    PPCRecompiler_stopStatsThread();
     s_threadPool.Stop();
 
     while (!PPCRecompilerState.targetQueue.empty())
