@@ -10,12 +10,14 @@ import Foundation
 public enum CPUMode: Int, CaseIterable {
     case interpreter
     case recompiler
+    case recompilerSingleCore
     case auto
 
     init(_ cpuMode: ObjCCPUMode) {
         switch cpuMode {
         case .singlecoreInterpreter, .multicoreInterpreter: self = .interpreter
         case .auto: self = .auto
+        case .singlecoreRecompiler: self = .recompilerSingleCore
         default: self = .recompiler
         }
     }
@@ -24,6 +26,7 @@ public enum CPUMode: Int, CaseIterable {
         switch self {
         case .interpreter: return .multicoreInterpreter
         case .recompiler: return .multicoreRecompiler
+        case .recompilerSingleCore: return .singlecoreRecompiler
         case .auto: return .auto
         }
     }
@@ -32,6 +35,7 @@ public enum CPUMode: Int, CaseIterable {
         switch self {
         case .interpreter: return "Interpreter"
         case .recompiler: return "Recompiler (JIT)"
+        case .recompilerSingleCore: return "Recompiler (JIT, single core)"
         case .auto: return "Auto"
         }
     }
