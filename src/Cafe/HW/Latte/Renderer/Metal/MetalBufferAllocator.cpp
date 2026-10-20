@@ -48,7 +48,7 @@ bool MetalSynchronizedRingAllocator::allocateAdditionalUploadBuffer(uint32 sizeR
 		{
 			if (attempt >= 1)
 			{
-				m_mtlr->Flush(true);
+				const_cast<MetalRenderer*>(m_mtlr)->Flush(true);
 				std::this_thread::sleep_for(std::chrono::milliseconds(20 * attempt));
 			}
 			bufferAllocSize = (attempt == 0) ? std::max(smallSize, 1u << 20) : smallSize;
