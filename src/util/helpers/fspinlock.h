@@ -3,6 +3,7 @@
 // minimal but efficient non-recursive spinlock implementation
 
 #include <atomic>
+#include <cstdint>
 #include <thread>
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(_M_AMD64) || defined(__i386__) || defined(_M_IX86)
@@ -35,8 +36,20 @@ public:
 		{
 			if (!m_lockBool.exchange(true, std::memory_order_acquire))
 				break;
+			uint32_t spins = 0;
 			while (m_lockBool.load(std::memory_order_relaxed))
+			{
 				cemuSpinlockPause();
+#if defined(__APPLE__)
+				// iOS gives no priority donation to the thread that holds a spinlock. If the holder is descheduled, a pure spin wait can
+				// starve it for a very long time, so hand the CPU back after a short spin.
+				if (++spins >= 256)
+				{
+					std::this_thread::yield();
+					spins = 0;
+				}
+#endif
+			}
 		}
 	}
 

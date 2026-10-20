@@ -27,6 +27,8 @@
 #include <stdlib.h>
 #include <sys/sysctl.h>
 #include <mach/task_info.h>
+#include <mach/mach.h>
+#include <mach/thread_act.h>
 #include <mach/mach_init.h>
 #if __has_include(<os/proc.h>)
 #include <os/proc.h>
@@ -294,6 +296,9 @@ static std::atomic<uint64> s_statDeleted{0};
 static std::atomic<uint64> s_statActivated{0};
 static std::atomic<uint64> s_statDiscarded{0};
 static bool s_syncCompile = false; // MELOCAFE_JIT_SYNC=1
+static void* s_ifaceEnter = nullptr;
+static void* s_ifaceLeaveUnvisited = nullptr;
+static void* s_ifaceLeaveVisited = nullptr;
 
 struct DualMapArena
 {
@@ -1347,6 +1352,10 @@ bool PPCRecompiler_Init26() {
             ppcRecompilerInited = true;
             memory_logFreeAddressSpace("after JIT arena allocation");
             PPCRecompilerAArch64Gen_generateRecompilerInterfaceFunctions();
+            s_ifaceEnter = (void*)PPCRecompiler_enterRecompilerCode;
+            s_ifaceLeaveUnvisited = (void*)PPCRecompiler_leaveRecompilerCode_unvisited;
+            s_ifaceLeaveVisited = (void*)PPCRecompiler_leaveRecompilerCode_visited;
+            cemuLog_log(LogType::Force, "JIT interface functions: enter={:p} leave={:p} leaveVisited={:p}", s_ifaceEnter, s_ifaceLeaveUnvisited, s_ifaceLeaveVisited);
         }
     }
     catch (const std::exception& e)
@@ -1364,6 +1373,88 @@ bool PPCRecompiler_Init26() {
 
 
 // ---- periodic statistics ----
+#if defined(__APPLE__)
+// Samples the program counter and a short frame-pointer backtrace of every thread. Used when the emulator stops making progress.
+// Nothing is allocated or logged while a thread is suspended (the suspended thread could hold the malloc or log lock).
+struct PPCRecompilerThreadSample
+{
+    char name[40];
+    uint64 frames[10];
+    uint32 numFrames;
+};
+
+static void PPCRecompiler_dumpAllThreads(const char* reason)
+{
+    static PPCRecompilerThreadSample samples[96];
+    uint32 numSamples = 0;
+    thread_act_array_t threads = nullptr;
+    mach_msg_type_number_t count = 0;
+    if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS)
+        return;
+    const mach_port_t self = mach_thread_self();
+    for (mach_msg_type_number_t i = 0; i < count && numSamples < 96; i++)
+    {
+        thread_t t = threads[i];
+        if (t == self)
+            continue;
+        PPCRecompilerThreadSample& sample = samples[numSamples];
+        sample.name[0] = '\0';
+        sample.numFrames = 0;
+        uintptr_t stackLow = 0, stackHigh = 0;
+        pthread_t pt = pthread_from_mach_thread_np(t);
+        if (pt)
+        {
+            pthread_getname_np(pt, sample.name, sizeof(sample.name));
+            stackHigh = (uintptr_t)pthread_get_stackaddr_np(pt);
+            stackLow = stackHigh - pthread_get_stacksize_np(pt);
+        }
+        if (thread_suspend(t) != KERN_SUCCESS)
+            continue;
+        arm_thread_state64_t state;
+        mach_msg_type_number_t stateCount = ARM_THREAD_STATE64_COUNT;
+        if (thread_get_state(t, ARM_THREAD_STATE64, (thread_state_t)&state, &stateCount) == KERN_SUCCESS)
+        {
+            sample.frames[sample.numFrames++] = (uint64)arm_thread_state64_get_pc(state);
+            sample.frames[sample.numFrames++] = (uint64)arm_thread_state64_get_lr(state);
+            uintptr_t fp = (uintptr_t)arm_thread_state64_get_fp(state);
+            while (sample.numFrames < 10 && pt && fp >= stackLow && fp + 16 <= stackHigh && (fp & 15) == 0)
+            {
+                const uintptr_t* frame = (const uintptr_t*)fp;
+                sample.frames[sample.numFrames++] = (uint64)frame[1];
+                const uintptr_t next = frame[0];
+                if (next <= fp)
+                    break;
+                fp = next;
+            }
+        }
+        thread_resume(t);
+        numSamples++;
+    }
+    for (mach_msg_type_number_t i = 0; i < count; i++)
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_t));
+    mach_port_deallocate(mach_task_self(), self);
+
+    cemuLog_log(LogType::Force, "[Thread dump] {} ({} threads)", reason, numSamples);
+    for (uint32 i = 0; i < numSamples; i++)
+    {
+        std::string line;
+        for (uint32 f = 0; f < samples[i].numFrames; f++)
+        {
+            const uint64 addr = samples[i].frames[f];
+            Dl_info info;
+            if (addr >= (uint64)g_jitArenaRxBase && addr < (uint64)g_jitArenaRxEnd)
+                line += fmt::format(" [JIT {:#x}]", addr - (uint64)g_jitArenaRxBase);
+            else if (dladdr((void*)addr, &info) && info.dli_sname)
+                line += fmt::format(" {}+{}", info.dli_sname, addr - (uint64)info.dli_saddr);
+            else
+                line += fmt::format(" {:#x}", addr);
+        }
+        cemuLog_log(LogType::Force, "  [{}]{}", samples[i].name[0] ? samples[i].name : "?", line);
+    }
+}
+#endif
+
 static std::thread s_statsThread;
 static std::atomic<bool> s_statsStop{false};
 
@@ -1386,6 +1477,7 @@ static void PPCRecompiler_statsThreadFunc()
 {
     uint64 lastCompiled = 0, lastInval = 0, lastNs = 0;
     uint32 lastFrames = LatteGPUState.frameCounter;
+    uint32 stalledIntervals = 0, threadDumps = 0;
     auto lastTime = std::chrono::steady_clock::now();
     while (!s_statsStop.load())
     {
@@ -1407,12 +1499,23 @@ static void PPCRecompiler_statsThreadFunc()
         const double fps = seconds > 0.0 ? (double)(frames - lastFrames) / seconds : 0.0;
         lastFrames = frames;
         lastTime = now;
+        if (s_ifaceEnter && ((void*)PPCRecompiler_enterRecompilerCode != s_ifaceEnter || (void*)PPCRecompiler_leaveRecompilerCode_unvisited != s_ifaceLeaveUnvisited || (void*)PPCRecompiler_leaveRecompilerCode_visited != s_ifaceLeaveVisited))
+            cemuLog_log(LogType::Force, "[JIT] ERROR: interface function pointers changed! enter={:p} (was {:p}) leave={:p} (was {:p})", (void*)PPCRecompiler_enterRecompilerCode, s_ifaceEnter, (void*)PPCRecompiler_leaveRecompilerCode_unvisited, s_ifaceLeaveUnvisited);
+        stalledIntervals = (fps < 0.5) ? stalledIntervals + 1 : 0;
         cemuLog_log(LogType::Force, "[JIT stats] fps {:.1f} | compiled {} (+{} in 5s, {:.1f}ms avg, {:.0f}ms max) failed {} discarded {} deleted {} | invalidations {} (+{}, {} KiB) | queue {} | arena {}/{} MiB used{} | mem footprint {} MiB, available {} MiB",
             fps, compiled, compiled - lastCompiled, compiled ? (double)ns / compiled / 1e6 : 0.0, (double)s_statCompileMaxNs.load() / 1e6,
             s_statCompileFailed.load(), s_statDiscarded.load(), s_statDeleted.load(),
             inval, inval - lastInval, s_statInvalidatedBytes.load() >> 10, queued,
             (arenaTotal - arenaFree) >> 20, arenaTotal >> 20, s_jitArenaFull.load() ? " FULL" : "", footprintMB, availableMB);
         lastCompiled = compiled; lastInval = inval; lastNs = ns;
+#if defined(__APPLE__)
+        // No frame was presented for 10+ seconds: record what every thread is doing so freezes can be diagnosed from the log
+        if (stalledIntervals >= 2 && threadDumps < 4 && (stalledIntervals - 2) % 6 == 0)
+        {
+            threadDumps++;
+            PPCRecompiler_dumpAllThreads("no frames presented for 10s+");
+        }
+#endif
     }
 }
 

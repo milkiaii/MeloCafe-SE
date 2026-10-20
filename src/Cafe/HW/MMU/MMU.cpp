@@ -423,16 +423,13 @@ void memory_init()
 	{
 		// 4GiB reservation (contiguous or sparse) is not available. Fall back to the packed arena + page table.
 		cemuLog_log(LogType::Force, "Guest memory: {}, using page table mode", pageTableOverride == 1 ? "page table mode forced via MELOCAFE_PAGETABLE" : "4GiB reservation failed");
-		if (!memory_buildPageTable(true))
+		// The optional overlay arena (448MiB) is not reserved in page table mode: address space is the scarce resource on these devices
+		// (the JIT arena, the recompiler jump table and Metal all need it) and only a few graphic packs ask for the overlay.
+		if (!memory_buildPageTable(false))
 		{
-			// retry without the optional overlay arena (448MiB) to shrink the arena
-			cemuLog_log(LogType::Force, "Page table mode: retrying without the overlay arena");
-			if (!memory_buildPageTable(false))
-			{
-				// last resort: allow the big code/data ranges to live in separate reservations
-				cemuLog_log(LogType::Force, "Page table mode: retrying with separate reservations for adjacent ranges");
-				memory_buildPageTable(false, false);
-			}
+			// last resort: allow the big code/data ranges to live in separate reservations
+			cemuLog_log(LogType::Force, "Page table mode: retrying with separate reservations for adjacent ranges");
+			memory_buildPageTable(false, false);
 		}
 	}
 	if( !memory_base )
