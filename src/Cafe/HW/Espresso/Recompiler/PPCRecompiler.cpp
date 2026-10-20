@@ -534,7 +534,11 @@ bool PPCRecompiler_drainQueue()
     }
     
     PPCRecompilerState.recompilerSpinlock.unlock();
-    PPCRecompiler_recompileAtAddress(enterAddress);
+    // Only one function is compiled at a time. The IML/backend passes were only ever run from a single thread (the synchronous path
+    // also serializes with this mutex), so parallel compilation on the worker pool is not safe. Compiling still happens off the emulation threads.
+    std::lock_guard<std::mutex> compileLock(s_singleRecompilationMutex);
+    if (ppcRecompilerInstanceData->ppcRecompilerDirectJumpTable[enterAddress / 4] == PPCRecompiler_leaveRecompilerCode_visited)
+        PPCRecompiler_recompileAtAddress(enterAddress);
     return true;
 }
 
