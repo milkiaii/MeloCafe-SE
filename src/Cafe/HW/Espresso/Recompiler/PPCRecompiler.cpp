@@ -92,7 +92,8 @@ bool checkDebugged() {
 
 // iOS only lets a process execute JIT pages while a debugger / JIT enabler is attached (CS_DEBUGGED). Executing them earlier gets the process killed
 // ("CODESIGNING Invalid Page"). The enabler can attach a few seconds after launch, so wait for it instead of crashing on the first JIT entry.
-// This applies to every CPU mode that uses the recompiler, not just Auto.
+// This applies to every CPU mode that uses the recompiler, not just Auto. It runs on the UI thread during launch, so the wait is kept short: a longer
+// block freezes the app and gets it killed by the iOS watchdog.
 static bool PPCRecompiler_ensureJitAccess()
 {
     static int s_result = -1;
@@ -102,8 +103,8 @@ static bool PPCRecompiler_ensureJitAccess()
     const auto start = std::chrono::steady_clock::now();
     bool ok = checkDebugged();
     if (!ok)
-        cemuLog_log(LogType::Force, "JIT: debugger/JIT enabler not attached yet, waiting up to 15s for it");
-    while (!ok && std::chrono::steady_clock::now() - start < std::chrono::seconds(15))
+        cemuLog_log(LogType::Force, "JIT: debugger/JIT enabler not attached yet, waiting up to 3s for it");
+    while (!ok && std::chrono::steady_clock::now() - start < std::chrono::seconds(3))
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         ok = checkDebugged();
@@ -328,6 +329,11 @@ static std::atomic<uint64> s_statCompileMaxNs{0};
 static std::atomic<uint64> s_statInvalidations{0};
 static std::atomic<uint64> s_statInvalidatedBytes{0};
 static std::atomic<uint64> s_statDeleted{0};
+
+// host code range -> guest function address, for the diagnostics profiler only (see PPCRecompiler_profReport)
+struct JitFuncInfo { size_t size; uint32 ppcAddress; };
+static std::mutex s_jitFuncMapMutex;
+static std::map<uintptr_t, JitFuncInfo> s_jitFuncMap;
 static std::atomic<uint64> s_statActivated{0};
 static std::atomic<uint64> s_statDiscarded{0};
 static bool s_syncCompile = false; // MELOCAFE_JIT_SYNC=1
@@ -1017,6 +1023,11 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
     {
         r.storedRange = rangeStore_ppcRanges.storeRange(ppcRecFunc, r.ppcAddress, r.ppcAddress + r.ppcSize);
     }
+    if (ppcRecFunc->x86Code && ppcRecFunc->x86Size)
+    {
+        std::lock_guard<std::mutex> mapLock(s_jitFuncMapMutex);
+        s_jitFuncMap[(uintptr_t)ppcRecFunc->x86Code] = JitFuncInfo{ppcRecFunc->x86Size, ppcRecFunc->ppcAddress};
+    }
     PPCRecompilerState.recompilerSpinlock.unlock();
     return true;
 }
@@ -1219,6 +1230,11 @@ void PPCRecompiler_deleteFunction(PPCRecFunction_t* func)
         r.storedRange = nullptr;
     }
 
+    if (func->x86Code)
+    {
+        std::lock_guard<std::mutex> mapLock(s_jitFuncMapMutex);
+        s_jitFuncMap.erase((uintptr_t)func->x86Code);
+    }
     if (func->dualMapRegion.rwAlias)
     {
         PPCRecompiler_releaseJitArena(func->dualMapRegion);
@@ -1586,7 +1602,20 @@ static void PPCRecompiler_profTakeSample()
         std::string where;
         Dl_info info;
         if (sm.pc >= (uint64)g_jitArenaRxBase && sm.pc < (uint64)g_jitArenaRxEnd)
-            where = "JIT code";
+        {
+            uint32 ppcAddr = 0;
+            {
+                std::lock_guard<std::mutex> mapLock(s_jitFuncMapMutex);
+                auto it = s_jitFuncMap.upper_bound((uintptr_t)sm.pc);
+                if (it != s_jitFuncMap.begin())
+                {
+                    --it;
+                    if (sm.pc < it->first + it->second.size)
+                        ppcAddr = it->second.ppcAddress;
+                }
+            }
+            where = ppcAddr ? fmt::format("JIT code, guest function {:#010x}", ppcAddr) : std::string("JIT code (interface/unknown)");
+        }
         else if (dladdr((void*)sm.pc, &info) && info.dli_sname)
             where = info.dli_sname;
         else if (dladdr((void*)sm.pc, &info) && info.dli_fname)

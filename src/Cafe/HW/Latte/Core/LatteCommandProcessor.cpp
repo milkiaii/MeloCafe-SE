@@ -144,6 +144,7 @@ void LatteCP_signalEnterWait()
 uint32 LatteCP_readU32Deprc()
 {
 	// no display list active
+	uint32 idleLoops = 0;
 	while (true)
 	{
 		uint32 cmdWord;
@@ -170,7 +171,16 @@ uint32 LatteCP_readU32Deprc()
 		// still no command data available, do some other tasks
 		LatteTiming_HandleTimedVsync();
 		LatteAsyncCommands_checkAndExecute();
+#if BOOST_OS_IOS
+		// Polling for commands at full speed keeps a performance core busy (and the SoC hot) while the GPU thread is merely waiting for the CPU
+		// emulation. Once it has been idle for a little while, sleep briefly between polls instead.
+		if (++idleLoops > 100)
+			std::this_thread::sleep_for(std::chrono::microseconds(100));
+		else
+			std::this_thread::yield();
+#else
 		std::this_thread::yield();
+#endif
 		performanceMonitor.gpuTime_idleTime.endMeasuring();
 	}
 	UNREACHABLE;
