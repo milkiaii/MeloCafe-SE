@@ -48,11 +48,11 @@ static bool memory_reserveSparseRange(uintptr_t base, uint64_t offset, uint64_t 
 extern std::vector<struct MMURange*> g_mmuRanges; // defined further down
 
 uint8** g_memoryPageTable = nullptr;
-uint32* g_memoryReverseTable = nullptr;
+MMUTranslate::Arena g_memoryArenas[MMUTranslate::MAX_ARENAS];
+uint32 g_memoryArenaCount = 0;
 uint8* g_memoryArenaBase = nullptr;
-size_t g_memoryArenaSize = 0;
 
-static std::vector<uint32> s_pageTableBackingReverse; // owns the reverse table storage
+static std::vector<std::vector<uint32>> s_pageTableBackingReverse; // owns the reverse tables (one per arena)
 static std::vector<uint8*> s_pageTableBackingForward; // owns the forward table storage
 
 // MELOCAFE_PAGETABLE=1 forces page table mode, =0 disables the automatic fallback, unset = automatic fallback only
@@ -64,7 +64,9 @@ static int memory_getPageTableOverride()
 	return atoi(value) != 0 ? 1 : 0;
 }
 
-static bool memory_buildPageTable(bool includeOptionalRanges)
+// mergeAdjacentRanges: keep guest ranges that touch each other contiguous on the host (safest). Without it only overlapping ranges are merged,
+// which allows reservations as small as the biggest single range (MEM2, 1GiB) but a guest access that straddles two ranges would fault.
+static bool memory_buildPageTable(bool includeOptionalRanges, bool mergeAdjacentRanges = true)
 {
 	using namespace MMUTranslate;
 	struct Interval
@@ -92,51 +94,106 @@ static bool memory_buildPageTable(bool includeOptionalRanges)
 	std::vector<Interval> segments;
 	for (const auto& itr : intervals)
 	{
-		if (!segments.empty() && itr.begin <= segments.back().end)
+		if (!segments.empty() && (mergeAdjacentRanges ? itr.begin <= segments.back().end : itr.begin < segments.back().end))
 			segments.back().end = std::max(segments.back().end, itr.end);
 		else
 			segments.push_back(itr);
 	}
 
-	// arena layout: [fault granule][segment 0][guard][segment 1][guard]...
-	std::vector<size_t> hostOffsets;
-	size_t arenaSize = PAGE_SIZE;
-	for (const auto& seg : segments)
+	// Every segment stays contiguous on the host (a guest range is always one block of host memory). Segments are packed into one arena
+	// if the address space allows it, otherwise they are distributed over several smaller reservations. A guard granule follows every
+	// segment so a one-past-the-end host pointer still maps back to the guest address one past the end.
+	// Arena layout: [fault granule (first arena only)][segment][guard][segment][guard]...
+	std::vector<size_t> order(segments.size()); // segment indices, biggest first
+	for (size_t i = 0; i < order.size(); i++)
+		order[i] = i;
+	std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return (segments[a].end - segments[a].begin) > (segments[b].end - segments[b].begin); });
+
+	auto segSize = [&](size_t i) { return (size_t)(segments[i].end - segments[i].begin); };
+	std::vector<std::vector<std::vector<size_t>>> strategies; // strategy -> arena -> segment indices
+	strategies.push_back({order}); // everything in a single arena
+	if (order.size() > 1)
 	{
-		hostOffsets.push_back(arenaSize);
-		arenaSize += (size_t)(seg.end - seg.begin) + PAGE_SIZE;
+		std::vector<size_t> rest(order.begin() + 1, order.end());
+		strategies.push_back({rest, {order[0]}}); // biggest segment (MEM2) in its own arena
+	}
+	{
+		std::vector<std::vector<size_t>> perSegment;
+		for (size_t i : order)
+			perSegment.push_back({i});
+		if (perSegment.size() <= MAX_ARENAS)
+			strategies.push_back(perSegment);
 	}
 
-	uint8* arena = (uint8*)MemMapper::ReserveMemory(nullptr, arenaSize, MemMapper::PAGE_PERMISSION::P_NONE);
-	if (!arena)
+	for (size_t strategyIndex = 0; strategyIndex < strategies.size(); strategyIndex++)
 	{
-		cemuLog_log(LogType::Force, "Page table mode: unable to reserve {} MiB arena", arenaSize >> 20);
-		return false;
-	}
+		auto groups = strategies[strategyIndex];
+		auto groupSize = [&](const std::vector<size_t>& g) { size_t total = 0; for (size_t i : g) total += segSize(i) + PAGE_SIZE; return total; };
+		std::sort(groups.begin(), groups.end(), [&](const auto& a, const auto& b) { return groupSize(a) > groupSize(b); });
+		if (groups.size() > MAX_ARENAS)
+			continue;
 
-	s_pageTableBackingForward.assign(NUM_PAGES, arena); // everything unbacked points at the PROT_NONE fault granule
-	s_pageTableBackingReverse.assign(arenaSize >> PAGE_SHIFT, REVERSE_UNMAPPED);
-	for (size_t i = 0; i < segments.size(); i++)
-	{
-		const uint32 firstPage = (uint32)(segments[i].begin >> PAGE_SHIFT);
-		const uint32 endPage = (uint32)(segments[i].end >> PAGE_SHIFT); // wraps to 0 for a segment ending at 4GiB
-		const uint32 pageCount = (uint32)((segments[i].end - segments[i].begin) >> PAGE_SHIFT);
-		const size_t hostPage = hostOffsets[i] >> PAGE_SHIFT;
-		for (uint32 p = 0; p < pageCount; p++)
+		std::vector<uint8*> bases;
+		std::vector<size_t> sizes;
+		bool ok = true;
+		for (size_t g = 0; g < groups.size(); g++)
 		{
-			s_pageTableBackingForward[firstPage + p] = arena + hostOffsets[i] + ((size_t)p << PAGE_SHIFT);
-			s_pageTableBackingReverse[hostPage + p] = firstPage + p;
+			const size_t arenaSize = groupSize(groups[g]) + (g == 0 ? PAGE_SIZE : 0);
+			uint8* base = (uint8*)MemMapper::ReserveMemory(nullptr, arenaSize, MemMapper::PAGE_PERMISSION::P_NONE);
+			if (!base)
+			{
+				cemuLog_log(LogType::Force, "Page table mode: unable to reserve a {} MiB arena ({} arena layout)", arenaSize >> 20, groups.size());
+				ok = false;
+				break;
+			}
+			bases.push_back(base);
+			sizes.push_back(arenaSize);
 		}
-		s_pageTableBackingReverse[hostPage + pageCount] = endPage; // guard granule: maps one-past-the-end pointers back to the guest address
-	}
+		if (!ok)
+		{
+			for (size_t g = 0; g < bases.size(); g++)
+				MemMapper::FreeReservation(bases[g], sizes[g]);
+			continue;
+		}
 
-	g_memoryArenaBase = arena;
-	g_memoryArenaSize = arenaSize;
-	g_memoryReverseTable = s_pageTableBackingReverse.data();
-	g_memoryPageTable = s_pageTableBackingForward.data(); // enables page table mode, keep last
-	memory_base = arena; // only a non-null marker in this mode. Guest addresses must never be added to it
-	cemuLog_log(LogType::Force, "Page table mode: {} guest segments packed into a {} MiB arena at {:#x} (4GiB reservation not used)", segments.size(), arenaSize >> 20, (uintptr_t)arena);
-	return true;
+		uint8* faultGranule = bases[0];
+		s_pageTableBackingForward.assign(NUM_PAGES, faultGranule); // everything unbacked points at the PROT_NONE fault granule
+		s_pageTableBackingReverse.assign(groups.size(), {});
+		for (size_t g = 0; g < groups.size(); g++)
+		{
+			s_pageTableBackingReverse[g].assign(sizes[g] >> PAGE_SHIFT, REVERSE_UNMAPPED);
+			size_t hostOffset = (g == 0) ? PAGE_SIZE : 0;
+			// keep guest order inside an arena so that neighbouring segments stay in guest order on the host
+			std::vector<size_t> members = groups[g];
+			std::sort(members.begin(), members.end());
+			for (size_t segIndex : members)
+			{
+				const Interval& seg = segments[segIndex];
+				const uint32 firstPage = (uint32)(seg.begin >> PAGE_SHIFT);
+				const uint32 endPage = (uint32)(seg.end >> PAGE_SHIFT); // wraps to 0 for a segment ending at 4GiB
+				const uint32 pageCount = (uint32)((seg.end - seg.begin) >> PAGE_SHIFT);
+				const size_t hostPage = hostOffset >> PAGE_SHIFT;
+				for (uint32 p = 0; p < pageCount; p++)
+				{
+					s_pageTableBackingForward[firstPage + p] = bases[g] + hostOffset + ((size_t)p << PAGE_SHIFT);
+					s_pageTableBackingReverse[g][hostPage + p] = firstPage + p;
+				}
+				s_pageTableBackingReverse[g][hostPage + pageCount] = endPage; // guard granule
+				hostOffset += (size_t)(seg.end - seg.begin) + PAGE_SIZE;
+			}
+			g_memoryArenas[g] = {bases[g], sizes[g], s_pageTableBackingReverse[g].data()};
+		}
+		g_memoryArenaBase = faultGranule;
+		g_memoryArenaCount = (uint32)groups.size();
+		g_memoryPageTable = s_pageTableBackingForward.data(); // enables page table mode, keep last
+		memory_base = faultGranule; // only a non-null marker in this mode. Guest addresses must never be added to it
+		size_t totalSize = 0;
+		for (size_t sz : sizes)
+			totalSize += sz;
+		cemuLog_log(LogType::Force, "Page table mode: {} guest segments packed into {} arena(s), {} MiB total, first arena at {:#x} (4GiB reservation not used)", segments.size(), groups.size(), totalSize >> 20, (uintptr_t)faultGranule);
+		return true;
+	}
+	return false;
 }
 
 bool memory_isGuestRangeReserved(uint32 address, uint32 size)
@@ -370,7 +427,12 @@ void memory_init()
 		{
 			// retry without the optional overlay arena (448MiB) to shrink the arena
 			cemuLog_log(LogType::Force, "Page table mode: retrying without the overlay arena");
-			memory_buildPageTable(false);
+			if (!memory_buildPageTable(false))
+			{
+				// last resort: allow the big code/data ranges to live in separate reservations
+				cemuLog_log(LogType::Force, "Page table mode: retrying with separate reservations for adjacent ranges");
+				memory_buildPageTable(false, false);
+			}
 		}
 	}
 	if( !memory_base )

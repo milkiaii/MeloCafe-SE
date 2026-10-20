@@ -215,6 +215,8 @@ void MetalMemoryManager::UploadToBufferCache(const void* data, size_t offset, si
         auto blitCommandEncoder = m_mtlr->GetBlitCommandEncoder();
 
         auto allocation = m_stagingAllocator.AllocateBufferMemory(size, 1);
+        if (!allocation.memPtr)
+            return; // out of upload memory, skip this update instead of crashing
         memcpy(allocation.memPtr, data, size);
         m_stagingAllocator.FlushReservation(allocation);
 

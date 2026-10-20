@@ -1,4 +1,6 @@
 #include "Cafe/HW/Latte/Renderer/Metal/MetalBufferAllocator.h"
+#include <chrono>
+#include <thread>
 
 MetalBufferChunkedHeap::~MetalBufferChunkedHeap()
 {
@@ -25,21 +27,53 @@ void MetalSynchronizedRingAllocator::addUploadBufferSyncPoint(AllocatorBuffer_t&
 	buffer.queue_syncPoints.emplace(commandBuffer, offset);
 }
 
-void MetalSynchronizedRingAllocator::allocateAdditionalUploadBuffer(uint32 sizeRequiredForAlloc)
+bool MetalSynchronizedRingAllocator::allocateAdditionalUploadBuffer(uint32 sizeRequiredForAlloc)
 {
 	// calculate buffer size, should be a multiple of bufferAllocSize that is at least as large as sizeRequiredForAlloc
 	uint32 bufferAllocSize = m_minimumBufferAllocSize;
 	while (bufferAllocSize < sizeRequiredForAlloc)
 		bufferAllocSize += m_minimumBufferAllocSize;
 
+	MTL::Buffer* mtlBuffer = m_mtlr->GetDevice()->newBuffer(bufferAllocSize, m_options);
+	if (!mtlBuffer || !mtlBuffer->contents())
+	{
+		// Out of memory or address space (common on devices with 3GB of RAM). Try progressively smaller buffers, and wait for the GPU
+		// to finish its queued work so memory can be reclaimed, before giving up.
+		cemuLog_log(LogType::Force, "Metal: failed to allocate a {} KiB upload buffer (device allocated {} MiB, recommended working set {} MiB, {} upload buffers in use). Retrying", bufferAllocSize >> 10, m_mtlr->GetDevice()->currentAllocatedSize() >> 20, m_mtlr->GetDevice()->recommendedMaxWorkingSetSize() >> 20, m_buffers.size());
+		if (mtlBuffer)
+			mtlBuffer->release();
+		mtlBuffer = nullptr;
+		const uint32 smallSize = (sizeRequiredForAlloc + 0xFFFFF) & ~0xFFFFFu; // exact size rounded up to 1MiB
+		for (int attempt = 0; attempt < 3 && !mtlBuffer; attempt++)
+		{
+			if (attempt >= 1)
+			{
+				m_mtlr->Flush(true);
+				std::this_thread::sleep_for(std::chrono::milliseconds(20 * attempt));
+			}
+			bufferAllocSize = (attempt == 0) ? std::max(smallSize, 1u << 20) : smallSize;
+			mtlBuffer = m_mtlr->GetDevice()->newBuffer(bufferAllocSize, m_options);
+			if (mtlBuffer && !mtlBuffer->contents())
+			{
+				mtlBuffer->release();
+				mtlBuffer = nullptr;
+			}
+		}
+		if (!mtlBuffer)
+		{
+			cemuLog_log(LogType::Force, "Metal: unable to allocate an upload buffer of {} KiB, skipping the upload", smallSize >> 10);
+			return false;
+		}
+	}
+
 	AllocatorBuffer_t newBuffer{};
 	newBuffer.writeIndex = 0;
-	newBuffer.basePtr = nullptr;
-	newBuffer.mtlBuffer = m_mtlr->GetDevice()->newBuffer(bufferAllocSize, m_options);
+	newBuffer.mtlBuffer = mtlBuffer;
 	newBuffer.basePtr = (uint8*)newBuffer.mtlBuffer->contents();
 	newBuffer.size = bufferAllocSize;
 	newBuffer.index = (uint32)m_buffers.size();
 	m_buffers.push_back(newBuffer);
+	return true;
 }
 
 MetalSynchronizedRingAllocator::AllocatorReservation_t MetalSynchronizedRingAllocator::AllocateBufferMemory(uint32 size, uint32 alignment)
@@ -97,7 +131,8 @@ MetalSynchronizedRingAllocator::AllocatorReservation_t MetalSynchronizedRingAllo
 	}
 
 	// allocate new buffer
-	allocateAdditionalUploadBuffer(size);
+	if (!allocateAdditionalUploadBuffer(size))
+		return AllocatorReservation_t{}; // memPtr == nullptr: callers must skip the upload
 
 	return AllocateBufferMemory(size, alignment);
 }

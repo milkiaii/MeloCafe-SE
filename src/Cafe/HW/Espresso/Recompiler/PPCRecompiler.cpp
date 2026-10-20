@@ -51,6 +51,7 @@
 #endif
 #include "util/highresolutiontimer/HighResolutionTimer.h"
 #include "Cafe/HW/MMU/MMU.h"
+#include "Cafe/HW/Latte/Core/Latte.h"
 
 // Compilation runs on the worker thread pool. Set MELOCAFE_JIT_SYNC=1 to compile on the emulation threads instead (debugging aid).
 #ifndef PPCREC_FORCE_SYNCHRONOUS_COMPILATION
@@ -1384,6 +1385,8 @@ static void PPCRecompiler_getMemoryStats(uint64& footprintMB, uint64& availableM
 static void PPCRecompiler_statsThreadFunc()
 {
     uint64 lastCompiled = 0, lastInval = 0, lastNs = 0;
+    uint32 lastFrames = LatteGPUState.frameCounter;
+    auto lastTime = std::chrono::steady_clock::now();
     while (!s_statsStop.load())
     {
         for (int i = 0; i < 50 && !s_statsStop.load(); i++)
@@ -1398,8 +1401,14 @@ static void PPCRecompiler_statsThreadFunc()
         uint64 footprintMB, availableMB;
         PPCRecompiler_getMemoryStats(footprintMB, availableMB);
         const size_t arenaTotal = s_jitArena.region.size, arenaFree = s_jitArena.freeBytes();
-        cemuLog_log(LogType::Force, "[JIT stats] compiled {} (+{} in 5s, {:.1f}ms avg, {:.0f}ms max) failed {} discarded {} deleted {} | invalidations {} (+{}, {} KiB) | queue {} | arena {}/{} MiB used{} | mem footprint {} MiB, available {} MiB",
-            compiled, compiled - lastCompiled, compiled ? (double)ns / compiled / 1e6 : 0.0, (double)s_statCompileMaxNs.load() / 1e6,
+        const uint32 frames = LatteGPUState.frameCounter;
+        const auto now = std::chrono::steady_clock::now();
+        const double seconds = std::chrono::duration<double>(now - lastTime).count();
+        const double fps = seconds > 0.0 ? (double)(frames - lastFrames) / seconds : 0.0;
+        lastFrames = frames;
+        lastTime = now;
+        cemuLog_log(LogType::Force, "[JIT stats] fps {:.1f} | compiled {} (+{} in 5s, {:.1f}ms avg, {:.0f}ms max) failed {} discarded {} deleted {} | invalidations {} (+{}, {} KiB) | queue {} | arena {}/{} MiB used{} | mem footprint {} MiB, available {} MiB",
+            fps, compiled, compiled - lastCompiled, compiled ? (double)ns / compiled / 1e6 : 0.0, (double)s_statCompileMaxNs.load() / 1e6,
             s_statCompileFailed.load(), s_statDiscarded.load(), s_statDeleted.load(),
             inval, inval - lastInval, s_statInvalidatedBytes.load() >> 10, queued,
             (arenaTotal - arenaFree) >> 20, arenaTotal >> 20, s_jitArenaFull.load() ? " FULL" : "", footprintMB, availableMB);

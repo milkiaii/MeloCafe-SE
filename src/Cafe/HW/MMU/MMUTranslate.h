@@ -26,12 +26,23 @@ namespace MMUTranslate
 }
 
 // Forward table: one host page pointer per guest page. nullptr while in linear mode.
-// Guest pages that are not backed point at the arena's PROT_NONE guard page so a bad access faults like it does in linear mode.
+// Guest pages that are not backed point at the first arena's PROT_NONE guard page so a bad access faults like it does in linear mode.
 extern uint8** g_memoryPageTable;
-// Reverse table: one guest page index per host arena page (REVERSE_UNMAPPED for padding). nullptr while in linear mode.
-extern uint32* g_memoryReverseTable;
-extern uint8* g_memoryArenaBase;
-extern size_t g_memoryArenaSize;
+
+namespace MMUTranslate
+{
+	constexpr uint32 MAX_ARENAS = 16;
+	struct Arena
+	{
+		uint8* base;
+		size_t size; // includes the trailing guard granule
+		const uint32* reverse; // guest page index per host page of this arena (REVERSE_UNMAPPED for padding)
+	};
+}
+// Host reservations backing the guest address space in page table mode (usually one, several if the address space is fragmented)
+extern MMUTranslate::Arena g_memoryArenas[MMUTranslate::MAX_ARENAS];
+extern uint32 g_memoryArenaCount;
+extern uint8* g_memoryArenaBase; // first arena, starts with the PROT_NONE fault granule
 
 inline bool memory_isPageTableMode()
 {
@@ -49,17 +60,21 @@ inline uint8* memory_translate(uint32 guestAddress)
 // host pointer -> guest address. Returns 0 for pointers outside of guest memory in page table mode.
 inline uint32 memory_reverseTranslate(const void* hostPtr)
 {
-	if (g_memoryReverseTable != nullptr) [[unlikely]]
+	if (g_memoryArenaCount != 0) [[unlikely]]
 	{
 		const uint8* p = (const uint8*)hostPtr;
-		// unsigned compare also rejects p < arena base. size includes the trailing guard granule, so one-past-the-end is accepted
-		const size_t offset = (size_t)(p - g_memoryArenaBase);
-		if (offset >= g_memoryArenaSize)
-			return 0;
-		const uint32 guestPage = g_memoryReverseTable[offset >> MMUTranslate::PAGE_SHIFT];
-		if (guestPage == MMUTranslate::REVERSE_UNMAPPED)
-			return 0;
-		return (guestPage << MMUTranslate::PAGE_SHIFT) | (uint32)(offset & MMUTranslate::PAGE_MASK);
+		for (uint32 i = 0; i < g_memoryArenaCount; i++)
+		{
+			// unsigned compare also rejects p < arena base. size includes the trailing guard granule, so one-past-the-end is accepted
+			const size_t offset = (size_t)(p - g_memoryArenas[i].base);
+			if (offset >= g_memoryArenas[i].size)
+				continue;
+			const uint32 guestPage = g_memoryArenas[i].reverse[offset >> MMUTranslate::PAGE_SHIFT];
+			if (guestPage == MMUTranslate::REVERSE_UNMAPPED)
+				return 0;
+			return (guestPage << MMUTranslate::PAGE_SHIFT) | (uint32)(offset & MMUTranslate::PAGE_MASK);
+		}
+		return 0;
 	}
 	return (uint32)((uintptr_t)hostPtr - (uintptr_t)memory_base);
 }
@@ -68,7 +83,14 @@ inline uint32 memory_reverseTranslate(const void* hostPtr)
 inline bool memory_isHostPtrInGuestSpace(const void* hostPtr)
 {
 	const uint8* p = (const uint8*)hostPtr;
-	if (g_memoryPageTable != nullptr)
-		return (size_t)(p - g_memoryArenaBase) < g_memoryArenaSize;
+	if (g_memoryArenaCount != 0)
+	{
+		for (uint32 i = 0; i < g_memoryArenaCount; i++)
+		{
+			if ((size_t)(p - g_memoryArenas[i].base) < g_memoryArenas[i].size)
+				return true;
+		}
+		return false;
+	}
 	return p >= memory_base && p < (memory_base + 0x100000000ULL);
 }

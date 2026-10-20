@@ -111,7 +111,7 @@ public:
 	void GetStats(uint32& numBuffers, size_t& totalBufferSize, size_t& freeBufferSize) const;
 
 private:
-	void allocateAdditionalUploadBuffer(uint32 sizeRequiredForAlloc);
+	bool allocateAdditionalUploadBuffer(uint32 sizeRequiredForAlloc);
 	void addUploadBufferSyncPoint(AllocatorBuffer_t& buffer, uint32 offset);
 
 	const class MetalRenderer* m_mtlr;
