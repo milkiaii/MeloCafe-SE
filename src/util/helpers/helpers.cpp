@@ -177,6 +177,12 @@ void SetThreadName(const char* name)
 #endif
 #elif BOOST_OS_MACOS || BOOST_OS_IOS
 	pthread_setname_np(name);
+	// Threads without an explicit QoS class can be placed on the efficiency cores (the A13 has only 2 performance cores), which makes emulation speed
+	// erratic. The emulated CPU cores and the GPU command thread get the highest class, background compile work a lower one so it cannot starve them.
+	if (strncmp(name, "OSSched", 7) == 0 || strcmp(name, "LatteThread") == 0)
+		pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+	else if (strncmp(name, "PPCRecompiler", 13) == 0 || strncmp(name, "mtl", 3) == 0 || strncmp(name, "compilePl", 9) == 0)
+		pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
 #else
 	if(std::strlen(name) > 15)
 		cemuLog_log(LogType::Force, "Truncating thread name {} because it was longer than 15 characters", name);

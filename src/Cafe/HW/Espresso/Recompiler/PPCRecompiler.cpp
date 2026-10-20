@@ -30,6 +30,8 @@
 #include <mach/mach.h>
 #include <mach/thread_act.h>
 #include <mach/mach_init.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
 #if __has_include(<os/proc.h>)
 #include <os/proc.h>
 #endif
@@ -39,6 +41,8 @@
 #include "IML/IML.h"
 
 #include <atomic>
+#include <algorithm>
+#include <unordered_map>
 #include <chrono>
 #include <thread>
 #include <map>
@@ -85,6 +89,37 @@ bool checkDebugged() {
     return true;
 }
 #endif
+
+// iOS only lets a process execute JIT pages while a debugger / JIT enabler is attached (CS_DEBUGGED). Executing them earlier gets the process killed
+// ("CODESIGNING Invalid Page"). The enabler can attach a few seconds after launch, so wait for it instead of crashing on the first JIT entry.
+// This applies to every CPU mode that uses the recompiler, not just Auto.
+static bool PPCRecompiler_ensureJitAccess()
+{
+    static int s_result = -1;
+    if (s_result >= 0)
+        return s_result == 1;
+#if defined(__APPLE__) && BOOST_OS_IOS
+    const auto start = std::chrono::steady_clock::now();
+    bool ok = checkDebugged();
+    if (!ok)
+        cemuLog_log(LogType::Force, "JIT: debugger/JIT enabler not attached yet, waiting up to 15s for it");
+    while (!ok && std::chrono::steady_clock::now() - start < std::chrono::seconds(15))
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        ok = checkDebugged();
+    }
+    int flags = 0;
+    csops(getpid(), 0, &flags, sizeof(flags));
+    cemuLog_log(LogType::Force, "JIT: CS_DEBUGGED {} (csops flags {:#x}, waited {} ms)", ok ? "set" : "NOT set", (uint32)flags,
+        (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+    if (!ok)
+        cemuLog_log(LogType::Force, "JIT: not available, falling back to the interpreter. Enable JIT for this app before launching the game");
+    s_result = ok ? 1 : 0;
+#else
+    s_result = 1;
+#endif
+    return s_result == 1;
+}
 
 #if defined(__APPLE__) && defined(__aarch64__)
 
@@ -1300,7 +1335,7 @@ bool PPCRecompilerInitialized()
 }
 
 bool PPCRecompiler_Init26() {
-    if (!checkDebugged() && ActiveSettings::GetCPUMode() == CPUMode::Auto) {
+    if (!PPCRecompiler_ensureJitAccess()) {
         cemuLog_log(LogType::Force, "Debugger not attached, JIT cannot continue.");
         ppcRecompilerEnabled = false;
         PPCCore_InitializePointer(ppcRecompilerEnabled);
@@ -1473,6 +1508,151 @@ static void PPCRecompiler_getMemoryStats(uint64& footprintMB, uint64& availableM
 #endif
 }
 
+#if defined(__APPLE__)
+// ---- lightweight sampling profiler (diagnostics only) ----
+// Every 100ms the stats thread records, for each thread, whether it is running and where its PC is. Every 5s the busiest threads and the hottest
+// code locations are logged, which shows whether time goes to JIT code, the interpreter, memory helpers, the GPU driver, etc.
+struct PPCProfSample
+{
+    char name[24];
+    uint64 tid;
+    uint64 pc;
+    uint64 cpuUs;
+    bool running;
+};
+
+static std::unordered_map<uint64, uint64> s_profLastCpuUs;
+static std::unordered_map<uint64, std::string> s_profNames;
+static std::unordered_map<std::string, uint32> s_profHist;
+static std::unordered_map<uint64, uint64> s_profCpuNow;
+static uint32 s_profSampleCount = 0;
+
+static void PPCRecompiler_profTakeSample()
+{
+    thread_act_array_t threads;
+    mach_msg_type_number_t count;
+    if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS)
+        return;
+    thread_t self = mach_thread_self();
+    PPCProfSample samples[128];
+    uint32 n = 0;
+    for (mach_msg_type_number_t i = 0; i < count && n < 128; i++)
+    {
+        thread_t t = threads[i];
+        if (t == self)
+            continue;
+        thread_identifier_info_data_t idInfo;
+        mach_msg_type_number_t idCount = THREAD_IDENTIFIER_INFO_COUNT;
+        if (thread_info(t, THREAD_IDENTIFIER_INFO, (thread_info_t)&idInfo, &idCount) != KERN_SUCCESS)
+            continue;
+        thread_basic_info_data_t bi;
+        mach_msg_type_number_t biCount = THREAD_BASIC_INFO_COUNT;
+        if (thread_info(t, THREAD_BASIC_INFO, (thread_info_t)&bi, &biCount) != KERN_SUCCESS)
+            continue;
+        PPCProfSample& sm = samples[n];
+        sm.name[0] = '\0';
+        sm.tid = idInfo.thread_id;
+        sm.pc = 0;
+        sm.cpuUs = (uint64)(bi.user_time.seconds + bi.system_time.seconds) * 1000000ull + (uint64)(bi.user_time.microseconds + bi.system_time.microseconds);
+        sm.running = bi.run_state == TH_STATE_RUNNING;
+        pthread_t pt = pthread_from_mach_thread_np(t);
+        if (pt)
+            pthread_getname_np(pt, sm.name, sizeof(sm.name));
+        if (sm.running && thread_suspend(t) == KERN_SUCCESS)
+        {
+            // nothing that can take a lock (malloc, dyld, logging) may run while the thread is suspended
+            arm_thread_state64_t state;
+            mach_msg_type_number_t stateCount = ARM_THREAD_STATE64_COUNT;
+            if (thread_get_state(t, ARM_THREAD_STATE64, (thread_state_t)&state, &stateCount) == KERN_SUCCESS)
+                sm.pc = (uint64)arm_thread_state64_get_pc(state);
+            thread_resume(t);
+        }
+        n++;
+    }
+    for (mach_msg_type_number_t i = 0; i < count; i++)
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_t));
+    mach_port_deallocate(mach_task_self(), self);
+
+    s_profSampleCount++;
+    for (uint32 i = 0; i < n; i++)
+    {
+        const PPCProfSample& sm = samples[i];
+        s_profCpuNow[sm.tid] = sm.cpuUs;
+        if (sm.name[0] && s_profNames.find(sm.tid) == s_profNames.end())
+            s_profNames[sm.tid] = sm.name;
+        if (!sm.running || sm.pc == 0)
+            continue;
+        std::string where;
+        Dl_info info;
+        if (sm.pc >= (uint64)g_jitArenaRxBase && sm.pc < (uint64)g_jitArenaRxEnd)
+            where = "JIT code";
+        else if (dladdr((void*)sm.pc, &info) && info.dli_sname)
+            where = info.dli_sname;
+        else if (dladdr((void*)sm.pc, &info) && info.dli_fname)
+        {
+            const char* base = strrchr(info.dli_fname, '/');
+            where = fmt::format("{}+{:#x}", base ? base + 1 : info.dli_fname, sm.pc - (uint64)info.dli_fbase);
+        }
+        else
+            where = fmt::format("{:#x}", sm.pc);
+        const char* tname = sm.name[0] ? sm.name : "?";
+        s_profHist[std::string(tname) + " : " + where]++;
+    }
+}
+
+static void PPCRecompiler_profReport(double seconds)
+{
+    // per-thread CPU usage (percent of one core) over the last interval
+    std::vector<std::pair<double, std::string>> cpu;
+    double total = 0.0;
+    for (auto& kv : s_profCpuNow)
+    {
+        const uint64 last = s_profLastCpuUs[kv.first];
+        const double pct = seconds > 0.0 ? (double)(kv.second - last) / 1e6 / seconds * 100.0 : 0.0;
+        s_profLastCpuUs[kv.first] = kv.second;
+        total += pct;
+        if (pct >= 3.0)
+        {
+            auto it = s_profNames.find(kv.first);
+            cpu.emplace_back(pct, it != s_profNames.end() ? it->second : fmt::format("tid{}", kv.first));
+        }
+    }
+    std::sort(cpu.begin(), cpu.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string line;
+    for (size_t i = 0; i < cpu.size() && i < 10; i++)
+        line += fmt::format(" {}={:.0f}%", cpu[i].second, cpu[i].first);
+    cemuLog_log(LogType::Force, "[CPU] total {:.0f}% of one core |{}", total, line);
+
+    std::vector<std::pair<uint32, std::string>> hist;
+    for (auto& kv : s_profHist)
+        hist.emplace_back(kv.second, kv.first);
+    std::sort(hist.begin(), hist.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string hl;
+    for (size_t i = 0; i < hist.size() && i < 8; i++)
+        hl += fmt::format("\n    {:>3}%  {}", s_profSampleCount ? hist[i].first * 100 / s_profSampleCount : 0, hist[i].second);
+    if (!hl.empty())
+        cemuLog_log(LogType::Force, "[Profile] share of samples (per thread : location){}", hl);
+    s_profHist.clear();
+    s_profSampleCount = 0;
+}
+
+// NSProcessInfo.thermalState (0 nominal, 1 fair, 2 serious, 3 critical) and low power mode, read through the objc runtime
+static void PPCRecompiler_getThermalInfo(long& thermalState, bool& lowPower)
+{
+    thermalState = -1;
+    lowPower = false;
+    Class cls = objc_getClass("NSProcessInfo");
+    if (!cls)
+        return;
+    id pi = ((id(*)(Class, SEL))objc_msgSend)(cls, sel_registerName("processInfo"));
+    if (!pi)
+        return;
+    thermalState = ((long(*)(id, SEL))objc_msgSend)(pi, sel_registerName("thermalState"));
+    lowPower = ((signed char(*)(id, SEL))objc_msgSend)(pi, sel_registerName("isLowPowerModeEnabled")) != 0;
+}
+#endif
+
 static void PPCRecompiler_statsThreadFunc()
 {
     uint64 lastCompiled = 0, lastInval = 0, lastNs = 0;
@@ -1482,7 +1662,12 @@ static void PPCRecompiler_statsThreadFunc()
     while (!s_statsStop.load())
     {
         for (int i = 0; i < 50 && !s_statsStop.load(); i++)
+        {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+#if defined(__APPLE__)
+            PPCRecompiler_profTakeSample();
+#endif
+        }
         if (s_statsStop.load())
             break;
         size_t queued;
@@ -1508,6 +1693,15 @@ static void PPCRecompiler_statsThreadFunc()
             inval, inval - lastInval, s_statInvalidatedBytes.load() >> 10, queued,
             (arenaTotal - arenaFree) >> 20, arenaTotal >> 20, s_jitArenaFull.load() ? " FULL" : "", footprintMB, availableMB);
         lastCompiled = compiled; lastInval = inval; lastNs = ns;
+#if defined(__APPLE__)
+        {
+            long thermal; bool lowPower;
+            PPCRecompiler_getThermalInfo(thermal, lowPower);
+            static const char* const thermalNames[] = {"nominal", "fair", "serious", "critical"};
+            cemuLog_log(LogType::Force, "[Device] thermal {} | low power mode {}", (thermal >= 0 && thermal <= 3) ? thermalNames[thermal] : "?", lowPower ? "ON" : "off");
+            PPCRecompiler_profReport(seconds);
+        }
+#endif
 #if defined(__APPLE__)
         // No frame was presented for 10+ seconds: record what every thread is doing so freezes can be diagnosed from the log
         if (stalledIntervals >= 2 && threadDumps < 4 && (stalledIntervals - 2) % 6 == 0)
@@ -1564,7 +1758,7 @@ void PPCRecompiler_init()
 #endif
     
 #if defined(__APPLE__) && BOOST_OS_IOS
-    if (!checkDebugged() && ActiveSettings::GetCPUMode() == CPUMode::Auto) {
+    if (!PPCRecompiler_ensureJitAccess()) {
         cemuLog_log(LogType::Force, "Debugger not attached, JIT cannot continue.");
         ppcRecompilerEnabled = false;
         PPCCore_InitializePointer(ppcRecompilerEnabled);
